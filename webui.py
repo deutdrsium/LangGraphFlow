@@ -7,6 +7,7 @@ import uvicorn
 import uuid
 import json
 import threading
+from collections import deque
 
 # 导入 main.py 中的相关图定义与变量
 from main import graph_app
@@ -25,10 +26,20 @@ app.add_middleware(
 app.mount("/static", StaticFiles(directory="frontend"), name="static")
 
 sessions = {}
+task_queue = deque()
+
+class TaskData(BaseModel):
+    task_id: str
+    question_content: str
+    answer: str
+
+class CancelData(BaseModel):
+    task_id: str
 
 class RunData(BaseModel):
     question: str
     truth: str
+    task_id: str = None
 
 class HumanDecision(BaseModel):
     decision: str  # e.g., "Manual_Confirmed_Match" or "Manual_Overruled_Mismatch"
@@ -38,13 +49,67 @@ def get_ui():
     with open("frontend/index.html", "r", encoding="utf-8") as f:
         return HTMLResponse(content=f.read())
 
+@app.post("/api/task_data")
+async def receive_task_data(data: TaskData):
+    print(f"\n--- New Data Received! ---")
+    print(f"Task ID: {data.task_id}")
+    print(f"Question Length: {len(data.question_content)} chars")
+    # print(f"Question Preview: {data.question_content[:150]}...")
+    # print(f"Answer Preview: {data.answer[:150]}...")
+    print("--------------------------\n")
+    task_queue.append(data)
+    return {"status": "success", "message": "Data queued successfully"}
+
+@app.post("/api/cancel_task")
+async def cancel_task(data: CancelData):
+    print(f"\n--- Cancel Task Request Received ---")
+    print(f"Canceling Task ID: {data.task_id}")
+    
+    # 清理可能还在队列中未领取的任务
+    global task_queue
+    original_len = len(task_queue)
+    task_queue = deque([task for task in task_queue if task.task_id != data.task_id])
+    if len(task_queue) < original_len:
+        print(f"Task {data.task_id} cleared from queue")
+
+    # 中断并清理对应 session 的执行
+    found = False
+    for thread_id, session in sessions.items():
+        if session.get("state", {}).get("question_id") == data.task_id:
+            session["status"] = "cancelled"
+            print(f"Task {data.task_id} map to thread {thread_id} set to cancelled")
+            found = True
+            
+    if not found:
+         print(f"Warning: No valid session running for Task {data.task_id}")
+         
+    return {"status": "success", "message": "Task cancelled"}
+
+@app.get("/api/get_task")
+def get_task():
+    if task_queue:
+        task = task_queue.popleft()
+        return {"has_task": True, "task": task.dict()}
+    return {"has_task": False}
+
+@app.get("/api/task_result/{task_id}")
+def get_task_result(task_id: str):
+    # Iterate through all sessions to find the one matching task_id
+    for thread_id, session in sessions.items():
+        if session.get("state", {}).get("question_id") == task_id:
+            if session.get("status") == "finished":
+                return {"status": "finished", "data": session.get("state")}
+            elif session.get("status") in ["running", "blocked"]:
+                return {"status": session.get("status")}
+    return {"status": "not_found"}
+
 @app.post("/api/run")
 def start_run(data: RunData):
     thread_id = str(uuid.uuid4())
     config = {"configurable": {"thread_id": thread_id}}
     
     initial_state = {
-        "question_id": f"q_{thread_id[:4]}",
+        "question_id": data.task_id if data.task_id else f"q_{thread_id[:4]}",
         "question_context": data.question,
         "ground_truth": data.truth
     }
@@ -63,6 +128,11 @@ def start_run(data: RunData):
             sessions[thread_id]["nodes"]["type_classifier"] = {"status": "executing"}
             # 通过 generator 一步步执行
             for update in graph_app.stream(initial_state, config=config, stream_mode="updates"):
+                # 如果从外部被取消了
+                if sessions[thread_id].get("status") == "cancelled":
+                    print(f"\n[WebUI] Process for thread {thread_id} was cancelled mid-flight.", flush=True)
+                    return
+                
                 for node_name, node_update in update.items():
                     print(f"\n[WebUI] 节点 '{node_name}' 执行完成.", flush=True)
                     sessions[thread_id]["nodes"][node_name] = {"status": "success", "data": node_update}
@@ -140,6 +210,9 @@ def resume_run(thread_id: str, data: HumanDecision):
                     sessions[thread_id]["nodes"][next_node]["status"] = "executing"
 
             for update in graph_app.stream(None, config=config, stream_mode="updates"):
+                if sessions[thread_id].get("status") == "cancelled":
+                    return
+
                 for node_name, node_update in update.items():
                     sessions[thread_id]["nodes"][node_name] = {"status": "success", "data": node_update}
                     sessions[thread_id]["state"].update(node_update)

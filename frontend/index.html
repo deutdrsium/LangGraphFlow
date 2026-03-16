@@ -63,10 +63,14 @@
       const [selectedNode, setSelectedNode] = useState(null);
       const [nodeData, setNodeData] = useState({});
       
-      const [question, setQuestion] = useState("在 $7$ 维单位超正方体（所有坐标均在 $[0, 1]$ 之间）中，随机均匀地取出 $5$ 个点。如果点 $A$ 的所有坐标轴数值都大于点 $B$，则称 $A$ 支配 $B$。求这 $5$ 个点中，没有任何一个点被其他点“支配”的概率。");
-      const [truth, setTruth] = useState("0.87");
+      const [question, setQuestion] = useState("");
+      const [truth, setTruth] = useState("");
       const [statusPoller, setStatusPoller] = useState(null);
       
+      const [sessionStatus, setSessionStatus] = useState('idle'); // idle, running, blocked, finished, error
+      const [autoMode, setAutoMode] = useState(true);
+      const [taskId, setTaskId] = useState("");
+
       const onNodesChange = useCallback(
         (changes) => setNodes((nds) => applyNodeChanges(changes, nds)),
         []
@@ -76,12 +80,14 @@
         []
       );
 
-      const runGraph = async () => {
+      const runGraph = async (q = question, t = truth, tid = taskId) => {
+        if (!q || !q.trim()) return;
         try {
+          setSessionStatus('running');
           const res = await fetch('/api/run', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ question, truth })
+            body: JSON.stringify({ question: q, truth: t, task_id: tid })
           });
           const data = await res.json();
           setThreadId(data.thread_id);
@@ -91,6 +97,7 @@
           setNodes((nds) => nds.map(n => ({ ...n, style: { backgroundColor: '#ffffff' } })));
         } catch (e) {
           alert('Error starting graph');
+          setSessionStatus('error');
         }
       };
 
@@ -115,6 +122,7 @@
           const res = await fetch(`/api/status/${threadId}`);
           if (res.ok) {
             const data = await res.json();
+            setSessionStatus(data.status);
             
             // Update Nodes with colors
             setNodes((nds) => nds.map(n => {
@@ -129,67 +137,124 @@
             // Sync data
             setNodeData(data.nodes || {});
             
-            if (data.status === 'finished' || data.status === 'error') {
+            if (data.status === 'cancelled') {
               clearInterval(interval);
+              // 只有接收到取消或清空命令时，才重置实例
+              setSessionStatus('idle');
+              setThreadId(null);
+              setQuestion('');
+              setTruth('');
+              setTaskId('');
+              setNodes(INITIAL_NODES);
+              setNodeData({});
+              setSelectedNode(null); // 关闭侧边栏面板以防显示无意义数据
             }
+            // 如果是 finished 或 error，让它继续 polling 或根据需要处理，这样才能收到后续发来的 cancelled 状态
           }
         }, 1000);
         return () => clearInterval(interval);
       }, [threadId]);
+
+      // Auto poll for tasks
+      useEffect(() => {
+        if (!autoMode || sessionStatus !== 'idle') return;
+        
+        let active = true;
+        const poller = setInterval(async () => {
+          if (!active) return;
+          try {
+            const res = await fetch('/api/get_task');
+            if (res.ok) {
+              const data = await res.json();
+              if (data.has_task && data.task) {
+                setQuestion(data.task.question_content);
+                setTruth(data.task.answer);
+                setTaskId(data.task.task_id);
+                clearInterval(poller);
+                // Start execution
+                runGraph(data.task.question_content, data.task.answer, data.task.task_id);
+              }
+            }
+          } catch (e) {
+            console.error("Error fetching task");
+          }
+        }, 2000 + Math.random() * 1000); // Stagger polling slightly to prevent thunderherd
+        
+        return () => { active = false; clearInterval(poller); };
+      }, [autoMode, sessionStatus]);
 
       const onNodeClick = (_, node) => {
         setSelectedNode(node.id);
       };
 
       return (
-        <div className="flex w-full h-full overflow-hidden border">
-          <div className="flex-1 relative">
-             <ReactFlow
-              nodes={nodes}
-              edges={edges}
-              onNodesChange={onNodesChange}
-              onEdgesChange={onEdgesChange}
-              onNodeClick={onNodeClick}
-              fitView
-              attributionPosition="bottom-right"
-              id={`reactflow-${instanceId}`}
-            >
-              <Background />
-              <Controls showInteractive={false} />
-            </ReactFlow>
+        <div className="flex w-full h-full overflow-hidden border flex-col">
+          <div className="flex bg-gray-100 p-1 justify-between items-center text-[10px] border-b">
+            <div>
+              <span className="font-bold mr-2">State: {sessionStatus}</span>
+              {taskId && <span className="text-blue-600 truncate max-w-[100px] inline-block align-bottom">ID: {taskId}</span>}
+            </div>
+            <div>
+              <label className="flex items-center space-x-1 cursor-pointer">
+                <input type="checkbox" checked={autoMode} onChange={e => setAutoMode(e.target.checked)} />
+                <span>Auto</span>
+              </label>
+            </div>
           </div>
-          
-          {selectedNode && (
-            <div className="w-1/2 bg-white border-l h-full overflow-y-auto p-2 flex flex-col shadow-lg z-50 text-xs">
-              <div className="flex justify-between items-center mb-2">
-                <h2 className="font-bold">Node: {selectedNode}</h2>
-                <button onClick={() => setSelectedNode(null)} className="text-red-500 font-bold">X</button>
-              </div>
-              
-              {selectedNode === '__start__' && (
-                <div className="mb-2 space-y-2">
-                  <p><strong>Input Question & Truth</strong></p>
-                  <textarea 
-                    value={question} 
-                    onChange={e => setQuestion(e.target.value)}
-                    className="w-full border p-1 text-xs"
-                    rows="3"
-                    placeholder="Enter mathematical question..."
-                  />
-                  <input 
-                    value={truth} 
-                    onChange={e => setTruth(e.target.value)}
-                    className="w-full border p-1 text-xs" 
-                    placeholder="Ground Truth"
-                  />
-                  <button 
-                    onClick={runGraph} 
-                    className="bg-blue-600 text-white rounded px-2 py-1 w-full hover:bg-blue-700"
-                  >
-                    Run Graph
-                  </button>
+          <div className="flex w-full flex-1 overflow-hidden">
+            <div className="flex-1 relative">
+               <ReactFlow
+                nodes={nodes}
+                edges={edges}
+                onNodesChange={onNodesChange}
+                onEdgesChange={onEdgesChange}
+                onNodeClick={onNodeClick}
+                fitView
+                attributionPosition="bottom-right"
+                id={`reactflow-${instanceId}`}
+              >
+                <Background />
+                <Controls showInteractive={false} />
+              </ReactFlow>
+            </div>
+            
+            {selectedNode && (
+              <div className="w-1/2 bg-white border-l h-full overflow-y-auto p-2 flex flex-col shadow-lg z-50 text-xs">
+                <div className="flex justify-between items-center mb-2">
+                  <h2 className="font-bold">Node: {selectedNode}</h2>
+                  <button onClick={() => setSelectedNode(null)} className="text-red-500 font-bold">X</button>
                 </div>
-              )}
+                
+                {selectedNode === '__start__' && (
+                  <div className="mb-2 space-y-2">
+                    <p><strong>Input Question & Truth</strong></p>
+                    <textarea 
+                      value={question} 
+                      onChange={e => setQuestion(e.target.value)}
+                      className="w-full border p-1 text-xs"
+                      rows="3"
+                      placeholder="Enter mathematical question..."
+                    />
+                    <input 
+                      value={truth} 
+                      onChange={e => setTruth(e.target.value)}
+                      className="w-full border p-1 text-xs" 
+                      placeholder="Ground Truth"
+                    />
+                    <input 
+                      value={taskId} 
+                      onChange={e => setTaskId(e.target.value)}
+                      className="w-full border p-1 text-xs" 
+                      placeholder="Task ID"
+                    />
+                    <button 
+                      onClick={() => runGraph()} 
+                      className="bg-blue-600 text-white rounded px-2 py-1 w-full hover:bg-blue-700"
+                    >
+                      Run Graph
+                    </button>
+                  </div>
+                )}
               
               {selectedNode === 'human_review' && nodeData['human_review']?.status === 'blocked' && (
                 <div className="mb-2 bg-red-50 p-2 border border-red-200">
@@ -256,6 +321,7 @@
               </div>
             </div>
           )}
+          </div>
         </div>
       );
     }
@@ -265,8 +331,10 @@
       return (
         <div className="grid grid-cols-4 grid-rows-2 w-full h-full bg-gray-200 gap-1 p-1">
           {Array.from({ length: 8 }).map((_, i) => (
-            <div key={i} className="bg-white rounded shadow flex flex-col h-full overflow-hidden">
-              <div className="bg-gray-800 text-white text-xs font-bold p-1 text-center">Instance {i + 1}</div>
+            <div key={i} className="bg-white rounded shadow flex flex-col h-full overflow-hidden relative">
+              <div className="bg-gray-800 text-white text-xs font-bold p-1 flex justify-between">
+                <span>Instance {i + 1}</span>
+              </div>
               <div className="flex-1 overflow-hidden relative">
                 <GraphInstance instanceId={i} />
               </div>
