@@ -1,0 +1,5 @@
+{
+  "question_id": "d594cf60462a4a0789b0b364cc607e59",
+  "question_context": "Given the sequences defined by\n\\[\n\\begin{cases}\na_0=0,~a_1=1,~a_{n+1}=a_{n-1}+n a_n \\text{ for } n \\ge 1;\\\\[8pt]\nb_0=1,~b_1=0,~b_{n+1}=b_{n-1}+n b_n \\text{ for } n \\ge 1,\n\\end{cases}\n\\]\nevaluate \\lim_{n \\to \\infty}\\frac{a_n}{b_n}.",
+  "answer": "\\frac{I_0(2)}{I_1(2)}"
+}
