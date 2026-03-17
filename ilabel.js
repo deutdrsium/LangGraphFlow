@@ -208,8 +208,27 @@
              content += `<br><span style="color:#FF00FF">⚠️ 陷阱:</span> <span style="color:#FFF">${data.trap_reason}</span><br>`;
         }
         if (data.final_decision) {
-             let color = data.final_decision.includes('Match') ? '#00FF00' : '#f5222d';
-             content += `<br><span style="color:#00BFFF">裁判结论:</span> <span style="color:${color}"><b>${data.final_decision}</b></span> <span style="color:#888">(置信度: ${data.confidence_score})</span><br>`;
+             let color = '#FFD700'; // Default for HITL or others
+             if (data.final_decision.includes('Match') && !data.final_decision.includes('Mismatch')) {
+                 color = '#00FF00';
+             } else if (data.final_decision.includes('Mismatch')) {
+                 color = '#f5222d';
+             }
+             content += `<br><span style="color:#00BFFF">裁判结论:</span> <span style="color:${color}"><b>${data.final_decision}</b></span> <span style="color:#888">(置信度: ${data.confidence_score || '无'})</span><br>`;
+             
+             if (data.final_decision.includes('Mismatch') && data.verified_ans && data.verified_ans !== 'pass' && data.verified_ans.toLowerCase() !== 'null') {
+                 content += `<br><span style="color:#FFA500">✅ 修正答案:</span> <div style="color:#FFF; background:#333; padding:5px; border-radius:4px; margin-top:5px; max-height:100px; overflow-y:auto;">${data.verified_ans}</div>`;
+             }
+             
+             if (data.final_decision.includes('HITL')) {
+                 if (data.hitl_reason) {
+                     content += `<br><span style="color:#FF4500">🛑 HITL 原因:</span> <span style="color:#FFF">${data.hitl_reason}</span><br>`;
+                 }
+                 if (data.code_result || data.code_execution_result) {
+                     let codeRes = data.code_result || data.code_execution_result;
+                     content += `<br><span style="color:#00CED1">💻 代码运行结果:</span> <div style="color:#FFF; background:#222; padding:5px; border-radius:4px; margin-top:5px; max-height:150px; overflow-y:auto; font-family:monospace; white-space:pre-wrap;">${codeRes}</div>`;
+                 }
+             }
         }
         
         resultDiv.innerHTML = content;

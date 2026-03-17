@@ -45,7 +45,7 @@ class HumanDecision(BaseModel):
     decision: str  # e.g., "Manual_Confirmed_Match" or "Manual_Overruled_Mismatch"
 
 @app.get("/")
-def get_ui():
+async def get_ui():
     with open("frontend/index.html", "r", encoding="utf-8") as f:
         return HTMLResponse(content=f.read())
 
@@ -86,14 +86,14 @@ async def cancel_task(data: CancelData):
     return {"status": "success", "message": "Task cancelled"}
 
 @app.get("/api/get_task")
-def get_task():
+async def get_task():
     if task_queue:
         task = task_queue.popleft()
         return {"has_task": True, "task": task.dict()}
     return {"has_task": False}
 
 @app.get("/api/active_sessions")
-def get_active_sessions():
+async def get_active_sessions():
     active = []
     for tid, session in sessions.items():
         if session.get("status") not in ["cancelled", "error"]:
@@ -108,18 +108,25 @@ def get_active_sessions():
     return {"sessions": active[:8]}
 
 @app.get("/api/task_result/{task_id}")
-def get_task_result(task_id: str):
+async def get_task_result(task_id: str):
     # Iterate through all sessions to find the one matching task_id
     for thread_id, session in sessions.items():
         if session.get("state", {}).get("question_id") == task_id:
             if session.get("status") == "finished":
                 return {"status": "finished", "data": session.get("state")}
-            elif session.get("status") in ["running", "blocked"]:
-                return {"status": session.get("status")}
+            elif session.get("status") == "blocked":
+                # For HITL, consider it finished from the script's perspective
+                state_data = session.get("state").copy()
+                state_data["final_decision"] = "HITL"
+                state_data["hitl_reason"] = f"系统置信度低 ({state_data.get('confidence_score', 0)} < 75)，需要人工介入审查"
+                state_data["code_execution_result"] = state_data.get("execution_output", "")
+                return {"status": "finished", "data": state_data}
+            elif session.get("status") == "running":
+                return {"status": "running"}
     return {"status": "not_found"}
 
 @app.post("/api/run")
-def start_run(data: RunData):
+async def start_run(data: RunData):
     thread_id = str(uuid.uuid4())
     config = {"configurable": {"thread_id": thread_id}}
     
@@ -150,6 +157,8 @@ def start_run(data: RunData):
                 
                 for node_name, node_update in update.items():
                     print(f"\n[WebUI] 节点 '{node_name}' 执行完成.", flush=True)
+                    if node_update is None:
+                        node_update = {}
                     sessions[thread_id]["nodes"][node_name] = {"status": "success", "data": node_update}
                     sessions[thread_id]["state"].update(node_update)
                 
@@ -184,7 +193,7 @@ def start_run(data: RunData):
     return {"thread_id": thread_id}
 
 @app.get("/api/status/{thread_id}")
-def get_status(thread_id: str):
+async def get_status(thread_id: str):
     if thread_id not in sessions:
         return JSONResponse(status_code=404, content={"error": "Session not found"})
         
@@ -199,7 +208,7 @@ def get_status(thread_id: str):
     return sessions[thread_id]
 
 @app.post("/api/resume/{thread_id}")
-def resume_run(thread_id: str, data: HumanDecision):
+async def resume_run(thread_id: str, data: HumanDecision):
     if thread_id not in sessions:
         return JSONResponse(status_code=404, content={"error": "Session not found"})
         
@@ -229,6 +238,8 @@ def resume_run(thread_id: str, data: HumanDecision):
                     return
 
                 for node_name, node_update in update.items():
+                    if node_update is None:
+                        node_update = {}
                     sessions[thread_id]["nodes"][node_name] = {"status": "success", "data": node_update}
                     sessions[thread_id]["state"].update(node_update)
                 
@@ -244,6 +255,8 @@ def resume_run(thread_id: str, data: HumanDecision):
             sessions[thread_id]["status"] = "finished"
             sessions[thread_id]["nodes"]["__end__"] = {"status": "success", "data": sessions[thread_id]["state"]}
         except Exception as e:
+            import traceback
+            traceback.print_exc()
             sessions[thread_id]["status"] = "error"
             sessions[thread_id]["error"] = str(e)
             

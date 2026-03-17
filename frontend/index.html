@@ -119,37 +119,41 @@
       useEffect(() => {
         if (!threadId) return;
         const interval = setInterval(async () => {
-          const res = await fetch(`/api/status/${threadId}`);
-          if (res.ok) {
-            const data = await res.json();
-            setSessionStatus(data.status);
+          try {
+            const res = await fetch(`/api/status/${threadId}?_t=${Date.now()}`);
+            if (res.ok) {
+              const data = await res.json();
+              setSessionStatus(data.status);
             
-            // Update Nodes with colors
-            setNodes((nds) => nds.map(n => {
-              const nodeInfo = data.nodes[n.id];
-              let color = '#ffffff';
-              if (nodeInfo) {
-                 color = getColorForStatus(nodeInfo.status);
-              }
-              return { ...n, style: { backgroundColor: color } };
-            }));
+              // Update Nodes with colors
+              setNodes((nds) => nds.map(n => {
+                const nodeInfo = data.nodes[n.id];
+                let color = '#ffffff';
+                if (nodeInfo) {
+                   color = getColorForStatus(nodeInfo.status);
+                }
+                return { ...n, style: { backgroundColor: color } };
+              }));
 
-            // Sync data
-            setNodeData(data.nodes || {});
-            
-            if (data.status === 'cancelled') {
-              clearInterval(interval);
-              // 只有接收到取消或清空命令时，才重置实例
-              setSessionStatus('idle');
-              setThreadId(null);
-              setQuestion('');
-              setTruth('');
-              setTaskId('');
-              setNodes(INITIAL_NODES);
-              setNodeData({});
-              setSelectedNode(null); // 关闭侧边栏面板以防显示无意义数据
+              // Sync data
+              setNodeData(data.nodes || {});
+              
+              if (data.status === 'cancelled') {
+                clearInterval(interval);
+                // 只有接收到取消或清空命令时，才重置实例
+                setSessionStatus('idle');
+                setThreadId(null);
+                setQuestion('');
+                setTruth('');
+                setTaskId('');
+                setNodes(INITIAL_NODES);
+                setNodeData({});
+                setSelectedNode(null); // 关闭侧边栏面板以防显示无意义数据
+              }
+              // 如果是 finished 或 error，让它继续 polling 或根据需要处理，这样才能收到后续发来的 cancelled 状态
             }
-            // 如果是 finished 或 error，让它继续 polling 或根据需要处理，这样才能收到后续发来的 cancelled 状态
+          } catch (e) {
+            console.error("Error polling status");
           }
         }, 1000);
         return () => clearInterval(interval);
@@ -163,7 +167,7 @@
         const poller = setInterval(async () => {
           if (!active) return;
           try {
-            const res = await fetch('/api/get_task');
+            const res = await fetch(`/api/get_task?_t=${Date.now()}`);
             if (res.ok) {
               const data = await res.json();
               if (data.has_task && data.task) {
@@ -190,31 +194,44 @@
       // Initialize with existing session data if available
       useEffect(() => {
         if (initialSession && initialSession.thread_id) {
-          setThreadId(initialSession.thread_id);
-          setSessionStatus(initialSession.status);
-          setNodeData(initialSession.nodes || {});
-          
-          // Update nodes and edges based on initial session data
-          const updatedNodes = nodes.map(node => {
-            const nodeInfo = (initialSession.nodes || {})[node.id];
-            return { 
-              ...node, 
-              style: { backgroundColor: getColorForStatus(nodeInfo?.status || '') },
-              data: { ...node.data, ...nodeInfo?.data }
-            };
-          });
-          const updatedEdges = edges.map(edge => {
-            const edgeInfo = initialSession.edges?.find(e => e.id === edge.id);
-            return { 
-              ...edge, 
-              animated: edgeInfo?.status === 'executing',
-              label: edgeInfo?.label || edge.label
-            };
-          });
-          setNodes(updatedNodes);
-          setEdges(updatedEdges);
+          if (initialSession.thread_id !== threadId) {
+            setThreadId(initialSession.thread_id);
+            setSessionStatus(initialSession.status);
+            setNodeData(initialSession.nodes || {});
+            setTaskId(initialSession.task_id || "");
+
+            // Update nodes and edges based on initial session data
+            const updatedNodes = INITIAL_NODES.map(node => {
+              const nodeInfo = (initialSession.nodes || {})[node.id];
+              return {
+                ...node,
+                style: { backgroundColor: getColorForStatus(nodeInfo?.status || '') },
+                data: { ...node.data, ...nodeInfo?.data }
+              };
+            });
+            const updatedEdges = INITIAL_EDGES.map(edge => {
+              const edgeInfo = initialSession.edges?.find(e => e.id === edge.id); 
+              return {
+                ...edge,
+                animated: edgeInfo?.status === 'executing',
+                label: edgeInfo?.label || edge.label
+              };
+            });
+            setNodes(updatedNodes);
+            setEdges(updatedEdges);
+          }
+        } else if (!initialSession && threadId && sessionStatus !== 'running') {
+            // If the backend has dropped this session from active slots, and we are not actively running, reset to idle
+            setSessionStatus('idle');
+            setThreadId(null);
+            setQuestion('');
+            setTruth('');
+            setTaskId('');
+            setNodes(INITIAL_NODES);
+            setNodeData({});
+            setSelectedNode(null); 
         }
-      }, [initialSession]);
+      }, [initialSession, threadId, sessionStatus]);
 
       return (
         <div className="flex w-full h-full overflow-hidden border flex-col">
@@ -360,17 +377,23 @@
       const [loaded, setLoaded] = useState(false);
 
       useEffect(() => {
-        fetch('/api/active_sessions')
-          .then(res => res.json())
-          .then(data => {
-            setInitialSessions(data.sessions || []);
-            setLoaded(true);
-          })
-          .catch(e => {
-            console.error(e);
-            setLoaded(true);
-          });
-      }, []);
+        const fetchActive = () => {
+          fetch(`/api/active_sessions?_t=${Date.now()}`)
+            .then(res => res.json())
+            .then(data => {
+              setInitialSessions(data.sessions || []);
+              if (!loaded) setLoaded(true);
+            })
+            .catch(e => {
+              console.error(e);
+              if (!loaded) setLoaded(true);
+            });
+        };
+        
+        fetchActive();
+        const interval = setInterval(fetchActive, 2000);
+        return () => clearInterval(interval);
+      }, [loaded]);
 
       if (!loaded) return <div className="p-4">Loading active instances...</div>;
 
