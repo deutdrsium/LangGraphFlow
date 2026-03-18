@@ -3,8 +3,8 @@ import os
 import json
 import re
 import time
-import docker
-import requests
+import subprocess
+import tempfile
 from dotenv import load_dotenv
 from openai import OpenAI
 from pydantic import BaseModel
@@ -203,94 +203,44 @@ def analyze_and_solve_node(state: GraphState, config: RunnableConfig = None):
                     raise Exception(f"analyze_and_solve 连续失败3次 (非全部429限流)，阻塞: {e}")
 
 def code_executor_node(state: GraphState):
-    """Node 4: 安全代码沙盒执行器"""
+    """Node 4: 子进程代码执行器"""
     print("\n---> [Node: code_executor] 开始执行...", flush=True)
     generated_code = state.get("generated_code", "")
     if not generated_code.strip():
         return {"execution_output": "Error: No code to execute."}
 
-    execution_output = ""
     try:
-        docker_client = docker.from_env()
-        base_image = "math_sandbox:latest"
-        
-        # 1. 检查并构建包含常见库的基础镜像
+        # 将代码写入临时文件，避免命令行长度限制和转义问题
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".py", delete=False, encoding="utf-8") as f:
+            f.write(generated_code)
+            tmp_path = f.name
+
         try:
-            docker_client.images.get(base_image)
-        except docker.errors.ImageNotFound:
-            print("未找到基础沙盒镜像，正在构建包含常用数学库的 Docker 镜像 (可能需要几分钟)...")
-            dockerfile = "FROM python:3.10-slim\nRUN pip install numpy sympy z3-solver networkx matplotlib scipy"
-            from io import BytesIO
-            docker_client.images.build(fileobj=BytesIO(dockerfile.encode('utf-8')), tag=base_image, rm=True)
-            print("沙盒镜像构建完成。")
-
-        current_image = base_image
-        max_retries = 3
-
-        for attempt in range(max_retries):
-            # 启动沙盒容器（分离模式，避免直接阻塞主进程导致主Python卡死）
-            # 这里限制内存为 1g，并且不映射任何本地卷，以防恶意操作系统级破坏
-            container = docker_client.containers.run(
-                image=current_image,
-                command=["python", "-c", generated_code],
-                detach=True,
-                mem_limit="1g",
-                network_disabled=True # 断网策略提升安全
+            result = subprocess.run(
+                ["python", tmp_path],
+                capture_output=True,
+                text=True,
+                timeout=60
             )
-            
-            try:
-                # 阻塞等待最多 60 秒
-                result = container.wait(timeout=60)
-                
-                # 分离获取 stdout 和 stderr
-                stdout_logs = container.logs(stdout=True, stderr=False).decode("utf-8")
-                stderr_logs = container.logs(stdout=False, stderr=True).decode("utf-8")
-                
-                output_parts = []
-                if stdout_logs:
-                    output_parts.append(f"----- STDOUT -----\n{stdout_logs}")
-                if stderr_logs:
-                    output_parts.append(f"----- STDERR -----\n{stderr_logs}")
-                if result.get("StatusCode", 0) != 0:
-                    output_parts.append(f"Exit Code: {result.get('StatusCode')}")
-                    
-                execution_output = "\n".join(output_parts) if output_parts else "Success (No Output)"
-                
-                # 检查是否因为缺少库导致 ModuleNotFoundError
-                if "ModuleNotFoundError: No module named" in stderr_logs:
-                    import re
-                    match = re.search(r"No module named '([^']+)'", stderr_logs)
-                    if match and attempt < max_retries - 1:
-                        missing_module = match.group(1)
-                        print(f"检测到缺失库: {missing_module}，准备重新构建镜像并安装...")
-                        new_image_tag = f"math_sandbox_with_{missing_module}:latest"
-                        dockerfile = f"FROM {current_image}\nRUN pip install {missing_module}"
-                        from io import BytesIO
-                        # 构建包含缺失库的新镜像（此处会自动联网拉取依赖，但随后代码运行仍断网）
-                        docker_client.images.build(fileobj=BytesIO(dockerfile.encode('utf-8')), tag=new_image_tag, rm=True)
-                        current_image = new_image_tag
-                        container.remove(force=True)
-                        continue  # 重试执行
 
-                # 成功或其他错误，跳出重试循环
-                break
-                
-            except requests.exceptions.ReadTimeout:
-                # 如果超时，则强制销毁进程并记录报错信息
-                container.kill()
-                execution_output = "Error: Code execution exceeded the 60 seconds timeout."
-                break
-                
-            finally:
-                # 清理容器释放资源
-                try:
-                    container.remove(force=True)
-                except Exception:
-                    pass
-                
+            output_parts = []
+            if result.stdout:
+                output_parts.append(f"----- STDOUT -----\n{result.stdout}")
+            if result.stderr:
+                output_parts.append(f"----- STDERR -----\n{result.stderr}")
+            if result.returncode != 0:
+                output_parts.append(f"Exit Code: {result.returncode}")
+
+            execution_output = "\n".join(output_parts) if output_parts else "Success (No Output)"
+
+        except subprocess.TimeoutExpired:
+            execution_output = "Error: Code execution exceeded the 60 seconds timeout."
+        finally:
+            os.unlink(tmp_path)
+
     except Exception as e:
-        print(f"Docker API Error: {e}")
-        execution_output = f"Execution setup failed: {str(e)}"
+        print(f"Code execution error: {e}")
+        execution_output = f"Execution failed: {str(e)}"
 
     return {"execution_output": execution_output}
 
