@@ -109,6 +109,46 @@
         }
       };
 
+      const stopGraph = async () => {
+        if (!taskId && !threadId) return;
+        try {
+          if (taskId) {
+            await fetch('/api/cancel_task', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ task_id: taskId })
+            });
+          }
+          setSessionStatus('idle');
+          setThreadId(null);
+          setNodes(INITIAL_NODES);
+          setNodeData({});
+          setSelectedNode(null);
+        } catch (e) {
+          console.error('Error stopping graph');
+        }
+      };
+
+      const retryGraph = async () => {
+        if (!question || !question.trim()) return;
+        // 先停掉当前的
+        if (taskId) {
+          try {
+            await fetch('/api/cancel_task', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ task_id: taskId })
+            });
+          } catch (e) {}
+        }
+        setThreadId(null);
+        setNodes(INITIAL_NODES);
+        setNodeData({});
+        setSelectedNode(null);
+        // 重新跑
+        runGraph(question, truth, taskId);
+      };
+
       const resumeGraph = async (decision) => {
         try {
           await fetch(`/api/resume/${threadId}`, {
@@ -263,7 +303,13 @@
               <span className={`font-bold mr-2 ${sessionStatus === 'error' ? 'text-red-600' : ''}`}>State: {sessionStatus}</span>
               {taskId && <span className="text-blue-600 truncate max-w-[100px] inline-block align-bottom">ID: {taskId}</span>}
             </div>
-            <div>
+            <div className="flex items-center space-x-1">
+              {(sessionStatus === 'running' || sessionStatus === 'blocked') && (
+                <button onClick={stopGraph} className="bg-red-500 text-white px-1.5 rounded hover:bg-red-600" title="停止">Stop</button>
+              )}
+              {(sessionStatus === 'error' || sessionStatus === 'finished') && question && (
+                <button onClick={retryGraph} className="bg-blue-500 text-white px-1.5 rounded hover:bg-blue-600" title="重试">Retry</button>
+              )}
               <label className="flex items-center space-x-1 cursor-pointer">
                 <input type="checkbox" checked={autoMode} onChange={e => setAutoMode(e.target.checked)} />
                 <span>Auto</span>
