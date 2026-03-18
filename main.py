@@ -1,4 +1,4 @@
-from typing import TypedDict, Any, Literal
+from typing import TypedDict
 import os
 import json
 import re
@@ -7,7 +7,6 @@ import subprocess
 import tempfile
 from dotenv import load_dotenv
 from openai import OpenAI
-from pydantic import BaseModel
 from langgraph.graph import StateGraph, START, END
 from langgraph.checkpoint.memory import MemorySaver
 from langchain_core.runnables import RunnableConfig
@@ -19,14 +18,56 @@ client = OpenAI()
 streaming_store = {}
 
 
-class TrapCheckResult(BaseModel):
-    solvable: bool
-    reason: str
+def stream_chat(model: str, messages: list, temperature: float = 1.0, timeout: float = 60.0) -> str:
+    """统一的流式调用封装，返回最终正文内容（不含 reasoning）"""
+    response = client.chat.completions.create(
+        model=model,
+        messages=messages,
+        temperature=temperature,
+        stream=True,
+        timeout=timeout,
+        reasoning_effort="high"
+    )
+    content = ""
+    for chunk in response:
+        if chunk.choices:
+            delta = chunk.choices[0].delta
+            if delta.content:
+                content += delta.content
+                print(delta.content, end="", flush=True)
+    print()
+    return content
 
-class JudgeResult(BaseModel):
-    confidence: int
-    decision: Literal["Match", "Mismatch", "Error"]
-    verified_ans: str
+
+def stream_chat_with_display(model: str, messages: list, thread_id: str = None, temperature: float = 1.0, timeout: float = 60.0) -> str:
+    """流式调用封装（带 CoT 展示），返回最终正文内容"""
+    response = client.chat.completions.create(
+        model=model,
+        messages=messages,
+        temperature=temperature,
+        stream=True,
+        timeout=timeout,
+        reasoning_effort="high"
+    )
+    display_content = ""
+    final_content = ""
+    for chunk in response:
+        if chunk.choices:
+            delta = chunk.choices[0].delta
+            delta_dict = delta.model_dump()
+            reasoning = delta_dict.get("reasoning_content")
+            if reasoning:
+                display_content += reasoning
+                print(reasoning, end="", flush=True)
+            if delta.content:
+                display_content += delta.content
+                final_content += delta.content
+                print(delta.content, end="", flush=True)
+            if thread_id:
+                streaming_store[thread_id] = display_content
+    print()
+    return final_content
+
 
 class GraphState(TypedDict):
     question_id: str
@@ -52,47 +93,26 @@ def trap_check_node(state: GraphState):
     print("\n---> [Node: trap_check] 开始执行...", flush=True)
     question = state.get("question_context", "")
     prompt = os.getenv("TRAP_CHECK_PROMPT", "You are an expert math problem analyzer.")
-    support_structured = os.getenv("SUPPORT_STRUCTURED_OUTPUT", "True").lower() == "true"
+    prompt += '\n\nPlease return ONLY a JSON object: {"solvable": true/false, "reason": "<string>"}. If solvable, reason should be "pass". Do not use code blocks.'
 
     try:
-        if support_structured:
-            response = client.beta.chat.completions.parse(
-                model=os.getenv("MODEL_FLASH", "gemini-3-flash-preview"),
-                messages=[
-                    {"role": "system", "content": prompt},
-                    {"role": "user", "content": f"请判断以下题目是否可解：\n\n{question}"}
-                ],
-                response_format=TrapCheckResult,
-                temperature=1.0
-            )
-            result = response.choices[0].message.parsed
-            if not result.solvable:
-                print(f"\n>>> [陷阱检测] 题目不可解: {result.reason}")
-            return {
-                "trap_analysis": not result.solvable,
-                "trap_reason": result.reason if not result.solvable else "pass"
-            }
-        else:
-            prompt_with_instructions = prompt + "\n\nPlease return ONLY a JSON object: {\"solvable\": true/false, \"reason\": \"<string>\"}. If solvable, reason should be 'pass'. Do not use code blocks."
-            response = client.chat.completions.create(
-                model=os.getenv("MODEL_FLASH", "gemini-3-flash-preview"),
-                messages=[
-                    {"role": "system", "content": prompt_with_instructions},
-                    {"role": "user", "content": f"请判断以下题目是否可解：\n\n{question}"}
-                ],
-                temperature=1.0
-            )
-            content = response.choices[0].message.content.strip()
-            content = content.replace("```json", "").replace("```", "").strip()
-            result_dict = json.loads(content)
-            solvable = result_dict.get("solvable", True)
-            reason = result_dict.get("reason", "pass")
-            if not solvable:
-                print(f"\n>>> [陷阱检测] 题目不可解: {reason}")
-            return {
-                "trap_analysis": not solvable,
-                "trap_reason": reason if not solvable else "pass"
-            }
+        content = stream_chat(
+            model=os.getenv("MODEL_FLASH", "gemini-3-flash-preview"),
+            messages=[
+                {"role": "system", "content": prompt},
+                {"role": "user", "content": f"请判断以下题目是否可解：\n\n{question}"}
+            ]
+        )
+        content = content.replace("```json", "").replace("```", "").strip()
+        result_dict = json.loads(content)
+        solvable = result_dict.get("solvable", True)
+        reason = result_dict.get("reason", "pass")
+        if not solvable:
+            print(f"\n>>> [陷阱检测] 题目不可解: {reason}")
+        return {
+            "trap_analysis": not solvable,
+            "trap_reason": reason if not solvable else "pass"
+        }
     except Exception as e:
         print(f"Error in trap_check: {e}")
         # 检测失败时默认可解，交给后续节点处理
@@ -106,7 +126,6 @@ def solve_node(state: GraphState, config: RunnableConfig = None):
     print("\n---> [Node: solve] 开始执行...", flush=True)
     question = state.get("question_context", "")
     thread_id = config.get("configurable", {}).get("thread_id", None) if config else None
-
     system_prompt = os.getenv("SOLVE_PROMPT", "You are a helpful math assistant.")
 
     attempt = 0
@@ -114,45 +133,17 @@ def solve_node(state: GraphState, config: RunnableConfig = None):
 
     while True:
         try:
-            response = client.chat.completions.create(
+            final_content = stream_chat_with_display(
                 model=os.getenv("MODEL_PRO", "gemini-3.1-pro-preview"),
                 messages=[
                     {"role": "system", "content": system_prompt},
                     {"role": "user", "content": f"请求解以下题目：\n\n{question}"}
                 ],
-                temperature=1.0,
-                stream=True,
-                timeout=60.0
+                thread_id=thread_id
             )
-
-            display_content = ""
-            final_content = ""
-
-            print("\n--- [Solve] 开始流式输出 ---\n", end="")
-            for chunk in response:
-                if chunk.choices:
-                    delta = chunk.choices[0].delta
-                    delta_dict = delta.model_dump()
-
-                    reasoning = delta_dict.get("reasoning_content")
-                    if reasoning:
-                        display_content += reasoning
-                        print(reasoning, end="", flush=True)
-
-                    content = delta.content
-                    if content:
-                        display_content += content
-                        final_content += content
-                        print(content, end="", flush=True)
-
-                    if thread_id:
-                        streaming_store[thread_id] = display_content
-
-            print("\n--- [Solve] 流式输出结束 ---\n")
 
             match = re.search(r'```python\n(.*?)\n```', final_content, re.DOTALL)
             generated_code = match.group(1).strip() if match else final_content
-
             return {"generated_code": generated_code}
 
         except Exception as e:
@@ -220,8 +211,9 @@ def judge_node(state: GraphState):
     ground_truth = state.get("ground_truth", "")
     execution_output = state.get("execution_output", "")
     
-    prompt = os.getenv("JUDGE_PROMPT", "You are an expert mathematical judge. Compare the code execution output with the ground truth for the given question.")
-    
+    prompt = os.getenv("JUDGE_PROMPT", "You are an expert mathematical judge.")
+    prompt += '\n\nPlease return ONLY a JSON object: {"confidence": <int>, "decision": "Match" or "Mismatch" or "Error", "verified_ans": <string>}. Use "pass" for verified_ans if decision is Match. Do not use code blocks.'
+
     # 组装完整的判断内容
     user_content = f"""
 [Original Question]
@@ -233,43 +225,22 @@ def judge_node(state: GraphState):
 [Sandbox Execution Output]
 {execution_output}
 """
-    support_structured = os.getenv("SUPPORT_STRUCTURED_OUTPUT", "True").lower() == "true"
-    
+
     try:
-        if support_structured:
-            response = client.beta.chat.completions.parse(
-                model=os.getenv("MODEL_FLASH", "gemini-3-flash-preview"),
-                messages=[
-                    {"role": "system", "content": prompt},
-                    {"role": "user", "content": user_content}
-                ],
-                response_format=JudgeResult,
-                temperature=1.0
-            )
-            result = response.choices[0].message.parsed
-            return {
-                "confidence_score": float(result.confidence),
-                "final_decision": result.decision,
-                "verified_ans": result.verified_ans
-            }
-        else:
-            prompt_with_instructions = prompt + "\n\nPlease return ONLY a JSON object string exactly matching this schema: {\"confidence\": <int>, \"decision\": \"Match\" or \"Mismatch\" or \"Error\", \"verified_ans\": <string>}. Use 'pass' for verified_ans if decision is Match. Do not use code blocks."
-            response = client.chat.completions.create(
-                model=os.getenv("MODEL_FLASH", "gemini-3-flash-preview"),
-                messages=[
-                    {"role": "system", "content": prompt_with_instructions},
-                    {"role": "user", "content": user_content}
-                ],
-                temperature=1.0
-            )
-            content = response.choices[0].message.content.strip()
-            content = content.replace("```json", "").replace("```", "").strip()
-            result_dict = json.loads(content)
-            return {
-                "confidence_score": float(result_dict.get("confidence", 0)),
-                "final_decision": result_dict.get("decision", "Error"),
-                "verified_ans": result_dict.get("verified_ans", "pass")
-            }
+        content = stream_chat(
+            model=os.getenv("MODEL_FLASH", "gemini-3-flash-preview"),
+            messages=[
+                {"role": "system", "content": prompt},
+                {"role": "user", "content": user_content}
+            ]
+        )
+        content = content.replace("```json", "").replace("```", "").strip()
+        result_dict = json.loads(content)
+        return {
+            "confidence_score": float(result_dict.get("confidence", 0)),
+            "final_decision": result_dict.get("decision", "Error"),
+            "verified_ans": result_dict.get("verified_ans", "pass")
+        }
     except Exception as e:
         print(f"Error calling OpenAI API in judge: {e}")
         return {
@@ -285,7 +256,6 @@ def retry_solve_node(state: GraphState, config: RunnableConfig = None):
     first_code = state.get("generated_code", "")
     first_output = state.get("execution_output", "")
     thread_id = config.get("configurable", {}).get("thread_id", None) if config else None
-
     system_prompt = os.getenv("RETRY_SOLVE_PROMPT", "You are a helpful math assistant.")
 
     attempt = 0
@@ -293,41 +263,17 @@ def retry_solve_node(state: GraphState, config: RunnableConfig = None):
 
     while True:
         try:
-            response = client.chat.completions.create(
+            final_content = stream_chat_with_display(
                 model=os.getenv("MODEL_PRO", "gemini-3.1-pro-preview"),
                 messages=[
                     {"role": "system", "content": system_prompt},
                     {"role": "user", "content": f"请用与之前不同的方法求解以下题目：\n\n{question}\n\n之前的求解代码及其输出如下（仅供参考，请用不同的方法）：\n```python\n{first_code}\n```\n输出：{first_output}"}
                 ],
-                temperature=1.0,
-                stream=True,
-                timeout=60.0
+                thread_id=thread_id
             )
-
-            display_content = ""
-            final_content = ""
-
-            print("\n--- [Retry Solve] 开始流式输出 ---\n", end="")
-            for chunk in response:
-                if chunk.choices:
-                    delta = chunk.choices[0].delta
-                    delta_dict = delta.model_dump()
-                    reasoning = delta_dict.get("reasoning_content")
-                    if reasoning:
-                        display_content += reasoning
-                        print(reasoning, end="", flush=True)
-                    content = delta.content
-                    if content:
-                        display_content += content
-                        final_content += content
-                        print(content, end="", flush=True)
-                    if thread_id:
-                        streaming_store[thread_id] = display_content
-            print("\n--- [Retry Solve] 流式输出结束 ---\n")
 
             match = re.search(r'```python\n(.*?)\n```', final_content, re.DOTALL)
             retry_code = match.group(1).strip() if match else final_content
-
             return {"retry_code": retry_code}
 
         except Exception as e:
@@ -407,52 +353,29 @@ def retry_judge_node(state: GraphState):
 如果两次结果不一致，则判定 Error（说明求解不可靠，需人工介入）；
 如果至少一次结果与 Ground Truth 一致，则判定 Match。
 """
-    support_structured = os.getenv("SUPPORT_STRUCTURED_OUTPUT", "True").lower() == "true"
+    prompt += '\n\nPlease return ONLY a JSON object: {"confidence": <int>, "decision": "Match" or "Mismatch" or "Error", "verified_ans": <string>}. Do not use code blocks.'
 
     try:
-        if support_structured:
-            response = client.beta.chat.completions.parse(
-                model=os.getenv("MODEL_FLASH", "gemini-3-flash-preview"),
-                messages=[
-                    {"role": "system", "content": prompt},
-                    {"role": "user", "content": user_content}
-                ],
-                response_format=JudgeResult,
-                temperature=1.0
-            )
-            result = response.choices[0].message.parsed
-            return {
-                "retry_confidence": float(result.confidence),
-                "retry_decision": result.decision,
-                "retry_verified_ans": result.verified_ans,
-                "final_decision": result.decision,
-                "confidence_score": float(result.confidence),
-                "verified_ans": result.verified_ans
-            }
-        else:
-            prompt_with_instructions = prompt + "\n\nPlease return ONLY a JSON object: {\"confidence\": <int>, \"decision\": \"Match\" or \"Mismatch\" or \"Error\", \"verified_ans\": <string>}. Do not use code blocks."
-            response = client.chat.completions.create(
-                model=os.getenv("MODEL_FLASH", "gemini-3-flash-preview"),
-                messages=[
-                    {"role": "system", "content": prompt_with_instructions},
-                    {"role": "user", "content": user_content}
-                ],
-                temperature=1.0
-            )
-            content = response.choices[0].message.content.strip()
-            content = content.replace("```json", "").replace("```", "").strip()
-            result_dict = json.loads(content)
-            decision = result_dict.get("decision", "Error")
-            confidence = float(result_dict.get("confidence", 0))
-            verified_ans = result_dict.get("verified_ans", "pass")
-            return {
-                "retry_confidence": confidence,
-                "retry_decision": decision,
-                "retry_verified_ans": verified_ans,
-                "final_decision": decision,
-                "confidence_score": confidence,
-                "verified_ans": verified_ans
-            }
+        content = stream_chat(
+            model=os.getenv("MODEL_FLASH", "gemini-3-flash-preview"),
+            messages=[
+                {"role": "system", "content": prompt},
+                {"role": "user", "content": user_content}
+            ]
+        )
+        content = content.replace("```json", "").replace("```", "").strip()
+        result_dict = json.loads(content)
+        decision = result_dict.get("decision", "Error")
+        confidence = float(result_dict.get("confidence", 0))
+        verified_ans = result_dict.get("verified_ans", "pass")
+        return {
+            "retry_confidence": confidence,
+            "retry_decision": decision,
+            "retry_verified_ans": verified_ans,
+            "final_decision": decision,
+            "confidence_score": confidence,
+            "verified_ans": verified_ans
+        }
     except Exception as e:
         print(f"Error in retry_judge: {e}")
         return {

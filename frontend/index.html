@@ -26,23 +26,31 @@
     import ReactFlow, { Background, Controls, applyNodeChanges, applyEdgeChanges, MarkerType } from 'reactflow';
 
     const INITIAL_NODES = [
-      { id: '__start__', data: { label: 'START' }, position: { x: 300, y: 50 }, type: 'input' },
-      { id: 'type_classifier', data: { label: 'Type Classifier' }, position: { x: 300, y: 150 } },
-      { id: 'analyze_and_solve', data: { label: 'Analyze & Solve' }, position: { x: 300, y: 275 } },
-      { id: 'code_executor', data: { label: 'Code Executor' }, position: { x: 300, y: 400 } },
-      { id: 'judge', data: { label: 'Judge' }, position: { x: 300, y: 500 } },
-      { id: 'human_review', data: { label: 'Human Review (HITL)' }, position: { x: 450, y: 600 } },
-      { id: '__end__', data: { label: 'END' }, position: { x: 300, y: 700 }, type: 'output' }
+      { id: '__start__', data: { label: 'START' }, position: { x: 300, y: 30 }, type: 'input' },
+      { id: 'trap_check', data: { label: 'Trap Check' }, position: { x: 300, y: 120 } },
+      { id: 'solve', data: { label: 'Solve' }, position: { x: 300, y: 230 } },
+      { id: 'code_executor', data: { label: 'Code Executor' }, position: { x: 300, y: 340 } },
+      { id: 'judge', data: { label: 'Judge' }, position: { x: 300, y: 440 } },
+      { id: 'retry_solve', data: { label: 'Retry Solve' }, position: { x: 550, y: 440 } },
+      { id: 'retry_executor', data: { label: 'Retry Executor' }, position: { x: 550, y: 540 } },
+      { id: 'retry_judge', data: { label: 'Retry Judge' }, position: { x: 550, y: 640 } },
+      { id: 'human_review', data: { label: 'Human Review (HITL)' }, position: { x: 300, y: 700 } },
+      { id: '__end__', data: { label: 'END' }, position: { x: 300, y: 810 }, type: 'output' }
     ];
 
     const INITIAL_EDGES = [
-      { id: 'e-start-type', source: '__start__', target: 'type_classifier', markerEnd: { type: MarkerType.ArrowClosed } },
-      { id: 'e-type-analyze', source: 'type_classifier', target: 'analyze_and_solve', markerEnd: { type: MarkerType.ArrowClosed } },
-      { id: 'e-analyze-exec', source: 'analyze_and_solve', target: 'code_executor', label: 'no trap', markerEnd: { type: MarkerType.ArrowClosed } },
-      { id: 'e-analyze-end', source: 'analyze_and_solve', target: '__end__', label: 'has trap', markerEnd: { type: MarkerType.ArrowClosed } },
+      { id: 'e-start-trap', source: '__start__', target: 'trap_check', markerEnd: { type: MarkerType.ArrowClosed } },
+      { id: 'e-trap-solve', source: 'trap_check', target: 'solve', label: 'solvable', markerEnd: { type: MarkerType.ArrowClosed } },
+      { id: 'e-trap-end', source: 'trap_check', target: '__end__', label: 'unsolvable', markerEnd: { type: MarkerType.ArrowClosed } },
+      { id: 'e-solve-exec', source: 'solve', target: 'code_executor', markerEnd: { type: MarkerType.ArrowClosed } },
       { id: 'e-exec-judge', source: 'code_executor', target: 'judge', markerEnd: { type: MarkerType.ArrowClosed } },
-      { id: 'e-judge-human', source: 'judge', target: 'human_review', label: 'confidence < 75', markerEnd: { type: MarkerType.ArrowClosed } },
-      { id: 'e-judge-end', source: 'judge', target: '__end__', label: 'pass/trap', markerEnd: { type: MarkerType.ArrowClosed } },
+      { id: 'e-judge-end', source: 'judge', target: '__end__', label: 'Match', markerEnd: { type: MarkerType.ArrowClosed } },
+      { id: 'e-judge-retry', source: 'judge', target: 'retry_solve', label: 'Mismatch', markerEnd: { type: MarkerType.ArrowClosed } },
+      { id: 'e-judge-human', source: 'judge', target: 'human_review', label: 'low conf', markerEnd: { type: MarkerType.ArrowClosed } },
+      { id: 'e-retry-exec', source: 'retry_solve', target: 'retry_executor', markerEnd: { type: MarkerType.ArrowClosed } },
+      { id: 'e-retryexec-judge', source: 'retry_executor', target: 'retry_judge', markerEnd: { type: MarkerType.ArrowClosed } },
+      { id: 'e-retryjudge-end', source: 'retry_judge', target: '__end__', label: 'consistent', markerEnd: { type: MarkerType.ArrowClosed } },
+      { id: 'e-retryjudge-human', source: 'retry_judge', target: 'human_review', label: 'inconsistent', markerEnd: { type: MarkerType.ArrowClosed } },
       { id: 'e-human-end', source: 'human_review', target: '__end__', markerEnd: { type: MarkerType.ArrowClosed } }
     ];
 
@@ -125,14 +133,24 @@
               const data = await res.json();
               setSessionStatus(data.status);
             
-              // Update Nodes with colors
+              // Update Nodes with colors and duration
               setNodes((nds) => nds.map(n => {
                 const nodeInfo = data.nodes[n.id];
                 let color = '#ffffff';
+                let durationLabel = '';
                 if (nodeInfo) {
                    color = getColorForStatus(nodeInfo.status);
+                   if (nodeInfo.duration != null) {
+                     durationLabel = ` (${nodeInfo.duration}s)`;
+                   } else if (nodeInfo.status === 'executing' && nodeInfo.start_time) {
+                     const elapsed = ((Date.now() / 1000) - nodeInfo.start_time).toFixed(0);
+                     durationLabel = ` (${elapsed}s...)`;
+                   }
                 }
-                return { ...n, style: { backgroundColor: color } };
+                // Find the original label from INITIAL_NODES
+                const originalNode = INITIAL_NODES.find(on => on.id === n.id);
+                const baseLabel = originalNode ? originalNode.data.label : n.id;
+                return { ...n, data: { ...n.data, label: baseLabel + durationLabel }, style: { backgroundColor: color } };
               }));
 
               // Sync data

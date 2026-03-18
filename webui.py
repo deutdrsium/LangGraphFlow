@@ -6,6 +6,7 @@ from pydantic import BaseModel
 import uvicorn
 import uuid
 import json
+import time
 import threading
 from collections import deque
 
@@ -147,30 +148,36 @@ async def start_run(data: RunData):
     def run_graph():
         print(f"\n[WebUI] 收到新请求开始图构建: {data.question[:20]}...", flush=True)
         try:
-            sessions[thread_id]["nodes"]["type_classifier"] = {"status": "executing"}
+            sessions[thread_id]["nodes"]["trap_check"] = {"status": "executing", "start_time": time.time()}
             # 通过 generator 一步步执行
             for update in graph_app.stream(initial_state, config=config, stream_mode="updates"):
                 # 如果从外部被取消了
                 if sessions[thread_id].get("status") == "cancelled":
                     print(f"\n[WebUI] Process for thread {thread_id} was cancelled mid-flight.", flush=True)
                     return
-                
+
                 for node_name, node_update in update.items():
                     print(f"\n[WebUI] 节点 '{node_name}' 执行完成.", flush=True)
                     if node_update is None:
                         node_update = {}
-                    sessions[thread_id]["nodes"][node_name] = {"status": "success", "data": node_update}
+                    # 计算耗时
+                    node_info = sessions[thread_id]["nodes"].get(node_name, {})
+                    start_time = node_info.get("start_time")
+                    duration = round(time.time() - start_time, 1) if start_time else None
+                    sessions[thread_id]["nodes"][node_name] = {"status": "success", "data": node_update, "duration": duration}
                     sessions[thread_id]["state"].update(node_update)
-                
+
                 # 获取接下来要执行的节点，将其状态设置为 executing
                 current_state = graph_app.get_state(config)
                 for next_node in current_state.next:
                     if next_node == "human_review":
                         continue  # human_review 会在循环结束后判断是否 blocked
                     if next_node not in sessions[thread_id]["nodes"]:
-                        sessions[thread_id]["nodes"][next_node] = {"status": "executing"}
+                        sessions[thread_id]["nodes"][next_node] = {"status": "executing", "start_time": time.time()}
                     elif sessions[thread_id]["nodes"][next_node].get("status") != "success":
                         sessions[thread_id]["nodes"][next_node]["status"] = "executing"
+                        if not sessions[thread_id]["nodes"][next_node].get("start_time"):
+                            sessions[thread_id]["nodes"][next_node]["start_time"] = time.time()
             
             # 判断是否被人工审核打断
             state_info = graph_app.get_state(config)
@@ -205,8 +212,8 @@ async def get_status(thread_id: str):
     import main
     if thread_id in main.streaming_store:
         # 如果代码生成器节点尚未写入最终结果，则向其中注入当前的流式文本
-        if "analyze_and_solve" in sessions[thread_id]["nodes"]:
-            node_info = sessions[thread_id]["nodes"]["analyze_and_solve"]
+        if "solve" in sessions[thread_id]["nodes"]:
+            node_info = sessions[thread_id]["nodes"]["solve"]
             if node_info.get("status") == "executing" or "generated_code" not in node_info.get("data", {}):
                 node_info["data"] = {"streaming_content": main.streaming_store[thread_id]}
                 
@@ -234,9 +241,11 @@ async def resume_run(thread_id: str, data: HumanDecision):
             current_state = graph_app.get_state(config)
             for next_node in current_state.next:
                 if next_node not in sessions[thread_id]["nodes"]:
-                    sessions[thread_id]["nodes"][next_node] = {"status": "executing"}
+                    sessions[thread_id]["nodes"][next_node] = {"status": "executing", "start_time": time.time()}
                 elif sessions[thread_id]["nodes"][next_node].get("status") != "success":
                     sessions[thread_id]["nodes"][next_node]["status"] = "executing"
+                    if not sessions[thread_id]["nodes"][next_node].get("start_time"):
+                        sessions[thread_id]["nodes"][next_node]["start_time"] = time.time()
 
             for update in graph_app.stream(None, config=config, stream_mode="updates"):
                 if sessions[thread_id].get("status") == "cancelled":
@@ -245,17 +254,22 @@ async def resume_run(thread_id: str, data: HumanDecision):
                 for node_name, node_update in update.items():
                     if node_update is None:
                         node_update = {}
-                    sessions[thread_id]["nodes"][node_name] = {"status": "success", "data": node_update}
+                    node_info = sessions[thread_id]["nodes"].get(node_name, {})
+                    start_time = node_info.get("start_time")
+                    duration = round(time.time() - start_time, 1) if start_time else None
+                    sessions[thread_id]["nodes"][node_name] = {"status": "success", "data": node_update, "duration": duration}
                     sessions[thread_id]["state"].update(node_update)
-                
+
                 current_state = graph_app.get_state(config)
                 for next_node in current_state.next:
                     if next_node == "human_review":
                         continue
                     if next_node not in sessions[thread_id]["nodes"]:
-                        sessions[thread_id]["nodes"][next_node] = {"status": "executing"}
+                        sessions[thread_id]["nodes"][next_node] = {"status": "executing", "start_time": time.time()}
                     elif sessions[thread_id]["nodes"][next_node].get("status") != "success":
                         sessions[thread_id]["nodes"][next_node]["status"] = "executing"
+                        if not sessions[thread_id]["nodes"][next_node].get("start_time"):
+                            sessions[thread_id]["nodes"][next_node]["start_time"] = time.time()
             
             sessions[thread_id]["status"] = "finished"
             sessions[thread_id]["nodes"]["__end__"] = {"status": "success", "data": sessions[thread_id]["state"]}
