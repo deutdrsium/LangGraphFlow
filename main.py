@@ -19,10 +19,9 @@ client = OpenAI()
 streaming_store = {}
 
 
-class ClassificationResult(BaseModel):
-    problem_type: Literal["几何", "代数", "概率", "数论"]
-    hierarchy: Literal["初中", "高中", "本科", "硕士及以上"]
-    difficulty: Literal["基础", "进阶", "竞赛"]
+class TrapCheckResult(BaseModel):
+    solvable: bool
+    reason: str
 
 class JudgeResult(BaseModel):
     confidence: int
@@ -33,7 +32,6 @@ class GraphState(TypedDict):
     question_id: str
     question_context: str
     ground_truth: str
-    problem_type: str
     trap_analysis: bool
     trap_reason: str
     generated_code: str
@@ -41,77 +39,75 @@ class GraphState(TypedDict):
     confidence_score: float
     final_decision: str
     verified_ans: str
-    hierarchy: str
-    difficulty: str
+    # 二次验证相关
+    retry_code: str
+    retry_output: str
+    retry_decision: str
+    retry_verified_ans: str
+    retry_confidence: float
 
 
-def type_classifier_node(state: GraphState):
-    """Node 1: 分类器"""
-    print("\n---> [Node: type_classifier] 开始执行...", flush=True)
+def trap_check_node(state: GraphState):
+    """Node 1: 可解性检测 - 判断题目是否存在逻辑陷阱或不可解"""
+    print("\n---> [Node: trap_check] 开始执行...", flush=True)
     question = state.get("question_context", "")
-    prompt = os.getenv("TYPE_CLASSIFIER_PROMPT", "You are an expert math problem classifier...")
+    prompt = os.getenv("TRAP_CHECK_PROMPT", "You are an expert math problem analyzer.")
     support_structured = os.getenv("SUPPORT_STRUCTURED_OUTPUT", "True").lower() == "true"
-    
+
     try:
         if support_structured:
             response = client.beta.chat.completions.parse(
                 model=os.getenv("MODEL_FLASH", "gemini-3-flash-preview"),
                 messages=[
                     {"role": "system", "content": prompt},
-                    {"role": "user", "content": f"Please classify the following question:\n\n{question}"}
+                    {"role": "user", "content": f"请判断以下题目是否可解：\n\n{question}"}
                 ],
-                response_format=ClassificationResult,
+                response_format=TrapCheckResult,
                 temperature=1.0
             )
             result = response.choices[0].message.parsed
+            if not result.solvable:
+                print(f"\n>>> [陷阱检测] 题目不可解: {result.reason}")
             return {
-                "problem_type": result.problem_type,
-                "hierarchy": result.hierarchy,
-                "difficulty": result.difficulty
+                "trap_analysis": not result.solvable,
+                "trap_reason": result.reason if not result.solvable else "pass"
             }
         else:
-            prompt_with_instructions = prompt + "\n\nPlease return ONLY a JSON object string exactly matching this schema: {\"problem_type\": \"几何|代数|概率|数论\", \"hierarchy\": \"初中|高中|本科|硕士及以上\", \"difficulty\": \"基础|进阶|竞赛\"}. Do not use code blocks."
+            prompt_with_instructions = prompt + "\n\nPlease return ONLY a JSON object: {\"solvable\": true/false, \"reason\": \"<string>\"}. If solvable, reason should be 'pass'. Do not use code blocks."
             response = client.chat.completions.create(
                 model=os.getenv("MODEL_FLASH", "gemini-3-flash-preview"),
                 messages=[
                     {"role": "system", "content": prompt_with_instructions},
-                    {"role": "user", "content": f"Please classify the following question:\n\n{question}"}
+                    {"role": "user", "content": f"请判断以下题目是否可解：\n\n{question}"}
                 ],
                 temperature=1.0
             )
             content = response.choices[0].message.content.strip()
             content = content.replace("```json", "").replace("```", "").strip()
             result_dict = json.loads(content)
+            solvable = result_dict.get("solvable", True)
+            reason = result_dict.get("reason", "pass")
+            if not solvable:
+                print(f"\n>>> [陷阱检测] 题目不可解: {reason}")
             return {
-                "problem_type": result_dict.get("problem_type", "代数"),
-                "hierarchy": result_dict.get("hierarchy", "高中"),
-                "difficulty": result_dict.get("difficulty", "基础")
+                "trap_analysis": not solvable,
+                "trap_reason": reason if not solvable else "pass"
             }
     except Exception as e:
-        print(f"Error calling OpenAI API: {e}")
-        # 如果调用失败时的默认 fallback，保证流程继续
+        print(f"Error in trap_check: {e}")
+        # 检测失败时默认可解，交给后续节点处理
         return {
-            "problem_type": "代数", 
-            "hierarchy": "高中", 
-            "difficulty": "基础"
+            "trap_analysis": False,
+            "trap_reason": "pass"
         }
 
-def analyze_and_solve_node(state: GraphState, config: RunnableConfig = None):
-    """Node 2: 陷阱分析 + 代码生成 (合并节点，使用强模型)"""
-    print("\n---> [Node: analyze_and_solve] 开始执行...", flush=True)
+def solve_node(state: GraphState, config: RunnableConfig = None):
+    """Node 2: 代码生成 (使用强模型求解题目)"""
+    print("\n---> [Node: solve] 开始执行...", flush=True)
     question = state.get("question_context", "")
-    problem_type = state.get("problem_type", "代数")
     thread_id = config.get("configurable", {}).get("thread_id", None) if config else None
 
-    # 根据题目类型加载对应的合并 prompt
-    prompt_env_map = {
-        "几何": "ANALYZE_AND_SOLVE_PROMPT_几何",
-        "代数": "ANALYZE_AND_SOLVE_PROMPT_代数",
-        "概率": "ANALYZE_AND_SOLVE_PROMPT_概率",
-        "数论": "ANALYZE_AND_SOLVE_PROMPT_数论"
-    }
-    env_key = prompt_env_map.get(problem_type, "ANALYZE_AND_SOLVE_PROMPT_代数")
-    system_prompt = os.getenv(env_key, "You are a helpful math assistant.")
+    system_prompt = os.getenv("SOLVE_PROMPT", "You are a helpful math assistant.")
 
     attempt = 0
     error_codes = []
@@ -122,85 +118,58 @@ def analyze_and_solve_node(state: GraphState, config: RunnableConfig = None):
                 model=os.getenv("MODEL_PRO", "gemini-3.1-pro-preview"),
                 messages=[
                     {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": f"请分析并求解以下题目：\n\n{question}"}
+                    {"role": "user", "content": f"请求解以下题目：\n\n{question}"}
                 ],
                 temperature=1.0,
                 stream=True,
                 timeout=60.0
             )
 
-            display_content = ""  # 用于前端实时展示，包含 CoT 和正文
-            final_content = ""    # 仅包含正文，用于最终解析
+            display_content = ""
+            final_content = ""
 
-            print("\n--- [Analyze & Solve] 开始流式输出 ---\n", end="")
+            print("\n--- [Solve] 开始流式输出 ---\n", end="")
             for chunk in response:
                 if chunk.choices:
                     delta = chunk.choices[0].delta
                     delta_dict = delta.model_dump()
 
-                    # 1. 获取并拼接思维链内容 (CoT)
                     reasoning = delta_dict.get("reasoning_content")
                     if reasoning:
                         display_content += reasoning
                         print(reasoning, end="", flush=True)
 
-                    # 2. 获取并拼接最终正文内容
                     content = delta.content
                     if content:
                         display_content += content
                         final_content += content
                         print(content, end="", flush=True)
 
-                    # 将包含 CoT 的完整记录更新到 WebUI 存储中
                     if thread_id:
                         streaming_store[thread_id] = display_content
 
-            print("\n--- [Analyze & Solve] 流式输出结束 ---\n")
+            print("\n--- [Solve] 流式输出结束 ---\n")
 
-            # 判断模型是否拒绝答题（检测到陷阱）
-            if "[TRAP_DETECTED]" in final_content:
-                trap_text = final_content.split("[TRAP_DETECTED]", 1)[1].strip()
-                # 取第一行作为 trap_reason，截断到100字
-                trap_reason = trap_text.split("\n")[0].strip()[:100]
-                if not trap_reason:
-                    trap_reason = "模型检测到逻辑陷阱但未给出原因"
+            match = re.search(r'```python\n(.*?)\n```', final_content, re.DOTALL)
+            generated_code = match.group(1).strip() if match else final_content
 
-                print(f"\n>>> [陷阱检测] 发现逻辑陷阱: {trap_reason}")
-                return {
-                    "trap_analysis": True,
-                    "trap_reason": trap_reason,
-                    "generated_code": "pass"
-                }
-            else:
-                # 正常代码生成，提取 python 代码块
-                match = re.search(r'```python\n(.*?)\n```', final_content, re.DOTALL)
-                if match:
-                    generated_code = match.group(1).strip()
-                else:
-                    generated_code = final_content
-
-                return {
-                    "trap_analysis": False,
-                    "trap_reason": "pass",
-                    "generated_code": generated_code
-                }
+            return {"generated_code": generated_code}
 
         except Exception as e:
             attempt += 1
             is_429 = (hasattr(e, 'status_code') and e.status_code == 429) or '429' in str(e)
             error_codes.append(429 if is_429 else 0)
-            print(f"Error in analyze_and_solve (attempt {attempt}): {e}", flush=True)
+            print(f"Error in solve (attempt {attempt}): {e}", flush=True)
 
             if attempt >= 3:
-                # 检查最近3次是否全部为429
                 if all(code == 429 for code in error_codes[-3:]):
-                    print(f"连续3次触发429限流，等待15s后继续重试...", flush=True)
+                    print("连续3次触发429限流，等待15s后继续重试...", flush=True)
                     time.sleep(15)
                     attempt = 0
                     error_codes.clear()
                     continue
                 else:
-                    raise Exception(f"analyze_and_solve 连续失败3次 (非全部429限流)，阻塞: {e}")
+                    raise Exception(f"solve 连续失败3次 (非全部429限流)，阻塞: {e}")
 
 def code_executor_node(state: GraphState):
     """Node 4: 子进程代码执行器"""
@@ -309,73 +278,287 @@ def judge_node(state: GraphState):
             "verified_ans": "pass"
         }
 
+def retry_solve_node(state: GraphState, config: RunnableConfig = None):
+    """Node: 二次验证 - 用不同思路重新求解"""
+    print("\n---> [Node: retry_solve] 首次 Mismatch，启动二次独立验证...", flush=True)
+    question = state.get("question_context", "")
+    first_code = state.get("generated_code", "")
+    first_output = state.get("execution_output", "")
+    thread_id = config.get("configurable", {}).get("thread_id", None) if config else None
+
+    system_prompt = os.getenv("RETRY_SOLVE_PROMPT", "You are a helpful math assistant.")
+
+    attempt = 0
+    error_codes = []
+
+    while True:
+        try:
+            response = client.chat.completions.create(
+                model=os.getenv("MODEL_PRO", "gemini-3.1-pro-preview"),
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": f"请用与之前不同的方法求解以下题目：\n\n{question}\n\n之前的求解代码及其输出如下（仅供参考，请用不同的方法）：\n```python\n{first_code}\n```\n输出：{first_output}"}
+                ],
+                temperature=1.0,
+                stream=True,
+                timeout=60.0
+            )
+
+            display_content = ""
+            final_content = ""
+
+            print("\n--- [Retry Solve] 开始流式输出 ---\n", end="")
+            for chunk in response:
+                if chunk.choices:
+                    delta = chunk.choices[0].delta
+                    delta_dict = delta.model_dump()
+                    reasoning = delta_dict.get("reasoning_content")
+                    if reasoning:
+                        display_content += reasoning
+                        print(reasoning, end="", flush=True)
+                    content = delta.content
+                    if content:
+                        display_content += content
+                        final_content += content
+                        print(content, end="", flush=True)
+                    if thread_id:
+                        streaming_store[thread_id] = display_content
+            print("\n--- [Retry Solve] 流式输出结束 ---\n")
+
+            match = re.search(r'```python\n(.*?)\n```', final_content, re.DOTALL)
+            retry_code = match.group(1).strip() if match else final_content
+
+            return {"retry_code": retry_code}
+
+        except Exception as e:
+            attempt += 1
+            is_429 = (hasattr(e, 'status_code') and e.status_code == 429) or '429' in str(e)
+            error_codes.append(429 if is_429 else 0)
+            print(f"Error in retry_solve (attempt {attempt}): {e}", flush=True)
+            if attempt >= 3:
+                if all(code == 429 for code in error_codes[-3:]):
+                    print("连续3次触发429限流，等待15s后继续重试...", flush=True)
+                    time.sleep(15)
+                    attempt = 0
+                    error_codes.clear()
+                    continue
+                else:
+                    raise Exception(f"retry_solve 连续失败3次: {e}")
+
+def retry_executor_node(state: GraphState):
+    """Node: 二次验证 - 执行重新生成的代码"""
+    print("\n---> [Node: retry_executor] 开始执行二次验证代码...", flush=True)
+    retry_code = state.get("retry_code", "")
+    if not retry_code.strip():
+        return {"retry_output": "Error: No retry code to execute."}
+
+    try:
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".py", delete=False, encoding="utf-8") as f:
+            f.write(retry_code)
+            tmp_path = f.name
+        try:
+            result = subprocess.run(
+                ["python", tmp_path],
+                capture_output=True, text=True, timeout=60
+            )
+            output_parts = []
+            if result.stdout:
+                output_parts.append(f"----- STDOUT -----\n{result.stdout}")
+            if result.stderr:
+                output_parts.append(f"----- STDERR -----\n{result.stderr}")
+            if result.returncode != 0:
+                output_parts.append(f"Exit Code: {result.returncode}")
+            retry_output = "\n".join(output_parts) if output_parts else "Success (No Output)"
+        except subprocess.TimeoutExpired:
+            retry_output = "Error: Code execution exceeded the 60 seconds timeout."
+        finally:
+            os.unlink(tmp_path)
+    except Exception as e:
+        print(f"Retry execution error: {e}")
+        retry_output = f"Execution failed: {str(e)}"
+
+    return {"retry_output": retry_output}
+
+def retry_judge_node(state: GraphState):
+    """Node: 二次裁判 - 综合两次执行结果做最终判定"""
+    print("\n---> [Node: retry_judge] 综合两次结果做最终判定...", flush=True)
+    question = state.get("question_context", "")
+    ground_truth = state.get("ground_truth", "")
+    first_output = state.get("execution_output", "")
+    retry_output = state.get("retry_output", "")
+
+    prompt = os.getenv("RETRY_JUDGE_PROMPT", os.getenv("JUDGE_PROMPT", "You are an expert mathematical judge."))
+
+    user_content = f"""
+[Original Question]
+{question}
+
+[Ground Truth]
+{ground_truth}
+
+[First Solve Output]
+{first_output}
+
+[Second Solve Output (independent method)]
+{retry_output}
+
+请综合两次独立求解的结果，判断 Ground Truth 是否正确。
+如果两次结果一致且与 Ground Truth 不同，则判定 Mismatch；
+如果两次结果不一致，则判定 Error（说明求解不可靠，需人工介入）；
+如果至少一次结果与 Ground Truth 一致，则判定 Match。
+"""
+    support_structured = os.getenv("SUPPORT_STRUCTURED_OUTPUT", "True").lower() == "true"
+
+    try:
+        if support_structured:
+            response = client.beta.chat.completions.parse(
+                model=os.getenv("MODEL_FLASH", "gemini-3-flash-preview"),
+                messages=[
+                    {"role": "system", "content": prompt},
+                    {"role": "user", "content": user_content}
+                ],
+                response_format=JudgeResult,
+                temperature=1.0
+            )
+            result = response.choices[0].message.parsed
+            return {
+                "retry_confidence": float(result.confidence),
+                "retry_decision": result.decision,
+                "retry_verified_ans": result.verified_ans,
+                "final_decision": result.decision,
+                "confidence_score": float(result.confidence),
+                "verified_ans": result.verified_ans
+            }
+        else:
+            prompt_with_instructions = prompt + "\n\nPlease return ONLY a JSON object: {\"confidence\": <int>, \"decision\": \"Match\" or \"Mismatch\" or \"Error\", \"verified_ans\": <string>}. Do not use code blocks."
+            response = client.chat.completions.create(
+                model=os.getenv("MODEL_FLASH", "gemini-3-flash-preview"),
+                messages=[
+                    {"role": "system", "content": prompt_with_instructions},
+                    {"role": "user", "content": user_content}
+                ],
+                temperature=1.0
+            )
+            content = response.choices[0].message.content.strip()
+            content = content.replace("```json", "").replace("```", "").strip()
+            result_dict = json.loads(content)
+            decision = result_dict.get("decision", "Error")
+            confidence = float(result_dict.get("confidence", 0))
+            verified_ans = result_dict.get("verified_ans", "pass")
+            return {
+                "retry_confidence": confidence,
+                "retry_decision": decision,
+                "retry_verified_ans": verified_ans,
+                "final_decision": decision,
+                "confidence_score": confidence,
+                "verified_ans": verified_ans
+            }
+    except Exception as e:
+        print(f"Error in retry_judge: {e}")
+        return {
+            "retry_confidence": 0.0,
+            "retry_decision": "Error",
+            "retry_verified_ans": "pass",
+            "final_decision": "Error",
+            "confidence_score": 0.0,
+            "verified_ans": "pass"
+        }
+
 def human_review_node(state: GraphState):
     """Node 6: 人工审查节点 (HITL)"""
     # 实际运行中，执行到此节点前会被打断。当恢复执行时，会运行此节点。
     print("--- [HITL] 人工审查节点触发，处理并向下流转 ---")
     return {}
 
-def route_after_analyze(state: GraphState) -> str:
-    """如果发现陷阱，不再执行代码，直接去结尾"""
+def route_after_trap_check(state: GraphState) -> str:
+    """如果发现不可解，直接去结尾；否则进入解题"""
     if state.get("trap_analysis", False) is True:
-        print(f"\n>>> [路由] 发现逻辑陷阱: {state.get('trap_reason')}\n>>> 终止其余节点，直接输出。")
+        print(f"\n>>> [路由] 题目不可解: {state.get('trap_reason')}\n>>> 终止流程，直接输出。")
         return "end"
-    return "code_executor"
+    return "solve"
 
 def route_after_judge(state: GraphState) -> str:
-    """条件路由逻辑"""
+    """条件路由逻辑：Match直通，Mismatch进二次验证，低置信进HITL"""
     confidence = state.get("confidence_score", 0.0)
+    decision = state.get("final_decision", "Error")
 
-    # 1. 裁判置信度低 -> 进人工打断
-    if confidence < 75:
-        print(f"\n>>> [路由] 置信度为 {confidence} < 75，转入人工审查 (HITL)...")
-        return "human_review"
-        
-    # 2. 否则 -> 直通终点
+    if decision == "Match" and confidence >= 75:
+        print(f"\n>>> [路由] Match (置信度 {confidence})，直接输出。")
+        return "end"
+    elif decision == "Mismatch" and confidence >= 75:
+        print(f"\n>>> [路由] Mismatch (置信度 {confidence})，进入二次独立验证...")
+        return "retry_solve"
     else:
-        print(f"\n>>> [路由] 置信度为 {confidence} >= 75，直接输出终局结论。")
+        print(f"\n>>> [路由] 置信度 {confidence} 不足或 Error，转入人工审查...")
+        return "human_review"
+
+def route_after_retry_judge(state: GraphState) -> str:
+    """二次裁判后的路由：两次一致则确认，不一致进HITL"""
+    decision = state.get("retry_decision", "Error")
+    confidence = state.get("retry_confidence", 0.0)
+
+    if decision == "Error" or confidence < 75:
+        print(f"\n>>> [二次路由] 两次结果不一致或置信度不足 ({confidence})，转入人工审查...")
+        return "human_review"
+    else:
+        print(f"\n>>> [二次路由] 二次验证结论: {decision} (置信度 {confidence})，直接输出。")
         return "end"
 
 # --- 构建 LangGraph 工作流 ---
 workflow = StateGraph(GraphState)
 
-workflow.add_node("type_classifier", type_classifier_node)
-workflow.add_node("analyze_and_solve", analyze_and_solve_node)
+workflow.add_node("trap_check", trap_check_node)
+workflow.add_node("solve", solve_node)
 workflow.add_node("code_executor", code_executor_node)
 workflow.add_node("judge", judge_node)
+workflow.add_node("retry_solve", retry_solve_node)
+workflow.add_node("retry_executor", retry_executor_node)
+workflow.add_node("retry_judge", retry_judge_node)
 workflow.add_node("human_review", human_review_node)
 
-# 从起点连向类型分类器
-workflow.add_edge(START, "type_classifier")
+# 起点 → 可解性检测
+workflow.add_edge(START, "trap_check")
 
-# 类型分类器流向合并节点（陷阱分析 + 代码生成）
-workflow.add_edge("type_classifier", "analyze_and_solve")
-
-# 根据合并节点的结果，如果有陷阱则直接终止到 END；否则正常流转到代码执行器
+# 可解性检测后：不可解 → 结束，可解 → 解题
 workflow.add_conditional_edges(
-    "analyze_and_solve",
-    route_after_analyze,
+    "trap_check",
+    route_after_trap_check,
     {
         "end": END,
-        "code_executor": "code_executor"
+        "solve": "solve"
     }
 )
 
-# 代码执行器流向裁判节点
+# 解题 → 执行 → 裁判
+workflow.add_edge("solve", "code_executor")
 workflow.add_edge("code_executor", "judge")
 
-# --------- 新增的条件边与 HITL ---------
-# 根据 Node 5 裁判的结果通过 route_after_judge 函数发往终点或人工审核
+# 裁判后三路分支：Match → 结束，Mismatch → 二次验证，低置信/Error → HITL
 workflow.add_conditional_edges(
     "judge",
     route_after_judge,
+    {
+        "end": END,
+        "retry_solve": "retry_solve",
+        "human_review": "human_review"
+    }
+)
+
+# 二次验证链路：重新解题 → 执行 → 二次裁判
+workflow.add_edge("retry_solve", "retry_executor")
+workflow.add_edge("retry_executor", "retry_judge")
+
+# 二次裁判后：结果一致 → 结束，不一致 → HITL
+workflow.add_conditional_edges(
+    "retry_judge",
+    route_after_retry_judge,
     {
         "end": END,
         "human_review": "human_review"
     }
 )
 
-# 人工节点流向终点
+# 人工审查 → 结束
 workflow.add_edge("human_review", END)
 
 import uuid

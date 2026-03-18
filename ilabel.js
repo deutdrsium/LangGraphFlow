@@ -44,7 +44,17 @@
     // 定义清空黑板的方法
     window.clearIlabelBlackboard = function() {
         localStorage.setItem('ilabel_active_tasks', '{}');
-        console.log("🧹 [防碰撞助手] 黑板已手动清空");
+        // 重置当前标签页的内部状态，使引擎重新检测并注册任务
+        lastProcessedTaskId = null;
+        hasSentData = false;
+        consecutiveSkips = 0;
+        isPaused = false;
+        isSkipping = false;
+        if (resultPollingTimer) clearInterval(resultPollingTimer);
+        resultDisplayed = false;
+        let resultDiv = document.getElementById("langgraph-result-window");
+        if (resultDiv) resultDiv.remove();
+        console.log("🧹 [防碰撞助手] 黑板已清空，当前标签页状态已重置");
         // 视觉反馈
         debugPanel.style.borderColor = "#FFF";
         setTimeout(() => { debugPanel.style.borderColor = "#444"; }, 500);
