@@ -245,11 +245,42 @@
               <span className={`font-bold mr-2 ${sessionStatus === 'error' ? 'text-red-600' : ''}`}>State: {sessionStatus}</span>
               {taskId && <span className="text-blue-600 truncate max-w-[100px] inline-block align-bottom">ID: {taskId}</span>}
             </div>
-            <div>
+            <div className="flex items-center space-x-2">
               <label className="flex items-center space-x-1 cursor-pointer">
                 <input type="checkbox" checked={autoMode} onChange={e => setAutoMode(e.target.checked)} />
                 <span>Auto</span>
               </label>
+              <button
+                className="bg-yellow-500 text-white px-1.5 rounded hover:bg-yellow-600 disabled:opacity-40"
+                disabled={sessionStatus === 'idle'}
+                onClick={async () => {
+                  if (!taskId) return;
+                  const savedQ = question, savedT = truth, savedTid = taskId;
+                  try {
+                    await fetch('/api/cancel_task', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ task_id: taskId }) });
+                  } catch(e) {}
+                  // Wait for cancelled status to reset, then re-run
+                  const wait = () => new Promise(r => setTimeout(r, 500));
+                  await wait();
+                  setSessionStatus('idle');
+                  setThreadId(null);
+                  setNodeData({});
+                  setSelectedNode(null);
+                  setNodes(INITIAL_NODES.map(n => ({ ...n, style: { backgroundColor: '#ffffff' } })));
+                  await wait();
+                  runGraph(savedQ, savedT, savedTid);
+                }}
+              >重启</button>
+              <button
+                className="bg-red-500 text-white px-1.5 rounded hover:bg-red-600 disabled:opacity-40"
+                disabled={sessionStatus === 'idle'}
+                onClick={async () => {
+                  if (!taskId) return;
+                  try {
+                    await fetch('/api/cancel_task', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ task_id: taskId }) });
+                  } catch(e) { console.error('Cancel failed', e); }
+                }}
+              >取消</button>
             </div>
           </div>
           <div className="flex w-full flex-1 overflow-hidden">

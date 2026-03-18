@@ -18,6 +18,19 @@ client = OpenAI()
 # 全局存储流式输出用于前端展示
 streaming_store = {}
 
+# Docker 客户端单例（设置较长超时以应对 Windows Named Pipe 偶发延迟）
+_docker_client = None
+def _get_docker_client():
+    global _docker_client
+    if _docker_client is None:
+        _docker_client = docker.from_env(timeout=120)
+    else:
+        try:
+            _docker_client.ping()
+        except Exception:
+            _docker_client = docker.from_env(timeout=120)
+    return _docker_client
+
 
 class ClassificationResult(BaseModel):
     problem_type: Literal["几何", "代数", "概率", "数论"]
@@ -159,9 +172,7 @@ def analyze_and_solve_node(state: GraphState, config: RunnableConfig = None):
 
             # 判断模型是否拒绝答题（检测到陷阱）
             if "[TRAP_DETECTED]" in final_content:
-                trap_text = final_content.split("[TRAP_DETECTED]", 1)[1].strip()
-                # 取第一行作为 trap_reason，截断到100字
-                trap_reason = trap_text.split("\n")[0].strip()[:100]
+                trap_reason = final_content.split("[TRAP_DETECTED]", 1)[1].strip()
                 if not trap_reason:
                     trap_reason = "模型检测到逻辑陷阱但未给出原因"
 
@@ -211,7 +222,7 @@ def code_executor_node(state: GraphState):
 
     execution_output = ""
     try:
-        docker_client = docker.from_env()
+        docker_client = _get_docker_client()
         base_image = "math_sandbox:latest"
         
         # 1. 检查并构建包含常见库的基础镜像
