@@ -27,15 +27,17 @@
 
     const INITIAL_NODES = [
       { id: '__start__', data: { label: 'START' }, position: { x: 300, y: 30 }, type: 'input' },
-      { id: 'trap_check', data: { label: 'Trap Check' }, position: { x: 300, y: 120 } },
-      { id: 'solve', data: { label: 'Solve' }, position: { x: 300, y: 230 } },
-      { id: 'code_executor', data: { label: 'Code Executor' }, position: { x: 300, y: 340 } },
-      { id: 'judge', data: { label: 'Judge' }, position: { x: 300, y: 440 } },
-      { id: 'retry_solve', data: { label: 'Retry Solve' }, position: { x: 550, y: 440 } },
-      { id: 'retry_executor', data: { label: 'Retry Executor' }, position: { x: 550, y: 540 } },
-      { id: 'retry_judge', data: { label: 'Retry Judge' }, position: { x: 550, y: 640 } },
-      { id: 'human_review', data: { label: 'Human Review (HITL)' }, position: { x: 300, y: 700 } },
-      { id: '__end__', data: { label: 'END' }, position: { x: 300, y: 810 }, type: 'output' }
+      { id: 'trap_check', data: { label: 'Trap Check' }, position: { x: 300, y: 110 } },
+      { id: 'solve', data: { label: 'Solve (Code)' }, position: { x: 300, y: 200 } },
+      { id: 'code_executor', data: { label: 'Code Executor' }, position: { x: 300, y: 290 } },
+      { id: 'judge', data: { label: 'Code Judge' }, position: { x: 300, y: 380 } },
+      { id: 'reasoning_solve', data: { label: 'Reasoning Solve' }, position: { x: 300, y: 470 } },
+      { id: 'final_judge', data: { label: 'Final Judge' }, position: { x: 300, y: 560 } },
+      { id: 'retry_solve', data: { label: 'Retry Solve' }, position: { x: 560, y: 560 } },
+      { id: 'retry_executor', data: { label: 'Retry Executor' }, position: { x: 560, y: 650 } },
+      { id: 'retry_judge', data: { label: 'Retry Judge' }, position: { x: 560, y: 740 } },
+      { id: 'human_review', data: { label: 'Human Review (HITL)' }, position: { x: 300, y: 810 } },
+      { id: '__end__', data: { label: 'END' }, position: { x: 300, y: 910 }, type: 'output' }
     ];
 
     const INITIAL_EDGES = [
@@ -44,9 +46,11 @@
       { id: 'e-trap-end', source: 'trap_check', target: '__end__', label: 'unsolvable', markerEnd: { type: MarkerType.ArrowClosed } },
       { id: 'e-solve-exec', source: 'solve', target: 'code_executor', markerEnd: { type: MarkerType.ArrowClosed } },
       { id: 'e-exec-judge', source: 'code_executor', target: 'judge', markerEnd: { type: MarkerType.ArrowClosed } },
-      { id: 'e-judge-end', source: 'judge', target: '__end__', label: 'Match', markerEnd: { type: MarkerType.ArrowClosed } },
-      { id: 'e-judge-retry', source: 'judge', target: 'retry_solve', label: 'Mismatch', markerEnd: { type: MarkerType.ArrowClosed } },
-      { id: 'e-judge-human', source: 'judge', target: 'human_review', label: 'low conf', markerEnd: { type: MarkerType.ArrowClosed } },
+      { id: 'e-judge-reasoning', source: 'judge', target: 'reasoning_solve', markerEnd: { type: MarkerType.ArrowClosed } },
+      { id: 'e-reasoning-final', source: 'reasoning_solve', target: 'final_judge', markerEnd: { type: MarkerType.ArrowClosed } },
+      { id: 'e-final-end', source: 'final_judge', target: '__end__', label: 'Match', markerEnd: { type: MarkerType.ArrowClosed } },
+      { id: 'e-final-retry', source: 'final_judge', target: 'retry_solve', label: 'Mismatch', markerEnd: { type: MarkerType.ArrowClosed } },
+      { id: 'e-final-human', source: 'final_judge', target: 'human_review', label: 'low conf', markerEnd: { type: MarkerType.ArrowClosed } },
       { id: 'e-retry-exec', source: 'retry_solve', target: 'retry_executor', markerEnd: { type: MarkerType.ArrowClosed } },
       { id: 'e-retryexec-judge', source: 'retry_executor', target: 'retry_judge', markerEnd: { type: MarkerType.ArrowClosed } },
       { id: 'e-retryjudge-end', source: 'retry_judge', target: '__end__', label: 'consistent', markerEnd: { type: MarkerType.ArrowClosed } },

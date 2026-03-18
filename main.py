@@ -86,6 +86,8 @@ class GraphState(TypedDict):
     retry_decision: str
     retry_verified_ans: str
     retry_confidence: float
+    # 纯推理相关
+    reasoning_answer: str
 
 
 def trap_check_node(state: GraphState):
@@ -387,6 +389,103 @@ def retry_judge_node(state: GraphState):
             "verified_ans": "pass"
         }
 
+def reasoning_solve_node(state: GraphState, config: RunnableConfig = None):
+    """Node: 纯推理求解 - 不写代码，直接用强模型推理给出答案"""
+    print("\n---> [Node: reasoning_solve] 纯推理求解...", flush=True)
+    question = state.get("question_context", "")
+    thread_id = config.get("configurable", {}).get("thread_id", None) if config else None
+    system_prompt = os.getenv("REASONING_SOLVE_PROMPT", "You are a helpful math assistant.")
+
+    attempt = 0
+    error_codes = []
+
+    while True:
+        try:
+            final_content = stream_chat_with_display(
+                model=os.getenv("MODEL_PRO", "gemini-3.1-pro-preview"),
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": f"请求解以下题目：\n\n{question}"}
+                ],
+                thread_id=thread_id
+            )
+            return {"reasoning_answer": final_content.strip()}
+
+        except Exception as e:
+            attempt += 1
+            is_429 = (hasattr(e, 'status_code') and e.status_code == 429) or '429' in str(e)
+            error_codes.append(429 if is_429 else 0)
+            print(f"Error in reasoning_solve (attempt {attempt}): {e}", flush=True)
+            if attempt >= 3:
+                if all(code == 429 for code in error_codes[-3:]):
+                    print("连续3次触发429限流，等待15s后继续重试...", flush=True)
+                    time.sleep(15)
+                    attempt = 0
+                    error_codes.clear()
+                    continue
+                else:
+                    raise Exception(f"reasoning_solve 连续失败3次: {e}")
+
+def final_judge_node(state: GraphState):
+    """Node: 最终裁判 - 综合代码执行结果和纯推理结果做最终判定"""
+    print("\n---> [Node: final_judge] 综合代码和推理结果做最终判定...", flush=True)
+    question = state.get("question_context", "")
+    ground_truth = state.get("ground_truth", "")
+    execution_output = state.get("execution_output", "")
+    code_decision = state.get("final_decision", "")
+    code_confidence = state.get("confidence_score", 0.0)
+    code_verified_ans = state.get("verified_ans", "")
+    reasoning_answer = state.get("reasoning_answer", "")
+
+    prompt = os.getenv("FINAL_JUDGE_PROMPT", os.getenv("JUDGE_PROMPT", "You are an expert mathematical judge."))
+    prompt += '\n\nPlease return ONLY a JSON object: {"confidence": <int>, "decision": "Match" or "Mismatch" or "Error", "verified_ans": <string>}. Do not use code blocks.'
+
+    user_content = f"""
+[Original Question]
+{question}
+
+[Ground Truth]
+{ground_truth}
+
+[Code Execution Output]
+{execution_output}
+
+[Code Judge Decision]
+{code_decision} (confidence: {code_confidence}, verified_ans: {code_verified_ans})
+
+[Pure Reasoning Answer]
+{reasoning_answer}
+
+请综合代码执行结果和纯推理结果，判断 Ground Truth 是否正确。
+- 如果代码结果和推理结果一致，且与 Ground Truth 一致，判定 Match
+- 如果代码结果和推理结果一致，且与 Ground Truth 不同，判定 Mismatch
+- 如果代码结果和推理结果不一致，以推理结果为主要参考（因为推理能处理代码无法求解的题型）
+- verified_ans 请用中文给出最终确认的正确答案（如果是 Match 则输出 'pass'）
+"""
+
+    try:
+        content = stream_chat(
+            model=os.getenv("MODEL_FLASH", "gemini-3-flash-preview"),
+            messages=[
+                {"role": "system", "content": prompt},
+                {"role": "user", "content": user_content}
+            ]
+        )
+        content = content.replace("```json", "").replace("```", "").strip()
+        result_dict = json.loads(content)
+        return {
+            "confidence_score": float(result_dict.get("confidence", 0)),
+            "final_decision": result_dict.get("decision", "Error"),
+            "verified_ans": result_dict.get("verified_ans", "pass")
+        }
+    except Exception as e:
+        print(f"Error in final_judge: {e}")
+        return {
+            "confidence_score": 0.0,
+            "final_decision": "Error",
+            "verified_ans": "pass"
+        }
+
 def human_review_node(state: GraphState):
     """Node 6: 人工审查节点 (HITL)"""
     # 实际运行中，执行到此节点前会被打断。当恢复执行时，会运行此节点。
@@ -400,8 +499,8 @@ def route_after_trap_check(state: GraphState) -> str:
         return "end"
     return "solve"
 
-def route_after_judge(state: GraphState) -> str:
-    """条件路由逻辑：Match直通，Mismatch进二次验证，低置信进HITL"""
+def route_after_final_judge(state: GraphState) -> str:
+    """最终裁判后的路由逻辑"""
     confidence = state.get("confidence_score", 0.0)
     decision = state.get("final_decision", "Error")
 
@@ -434,6 +533,8 @@ workflow.add_node("trap_check", trap_check_node)
 workflow.add_node("solve", solve_node)
 workflow.add_node("code_executor", code_executor_node)
 workflow.add_node("judge", judge_node)
+workflow.add_node("reasoning_solve", reasoning_solve_node)
+workflow.add_node("final_judge", final_judge_node)
 workflow.add_node("retry_solve", retry_solve_node)
 workflow.add_node("retry_executor", retry_executor_node)
 workflow.add_node("retry_judge", retry_judge_node)
@@ -452,14 +553,16 @@ workflow.add_conditional_edges(
     }
 )
 
-# 解题 → 执行 → 裁判
+# 代码链路：解题 → 执行 → 裁判 → 纯推理 → 最终裁判
 workflow.add_edge("solve", "code_executor")
 workflow.add_edge("code_executor", "judge")
+workflow.add_edge("judge", "reasoning_solve")
+workflow.add_edge("reasoning_solve", "final_judge")
 
-# 裁判后三路分支：Match → 结束，Mismatch → 二次验证，低置信/Error → HITL
+# 最终裁判后三路分支
 workflow.add_conditional_edges(
-    "judge",
-    route_after_judge,
+    "final_judge",
+    route_after_final_judge,
     {
         "end": END,
         "retry_solve": "retry_solve",
@@ -467,11 +570,11 @@ workflow.add_conditional_edges(
     }
 )
 
-# 二次验证链路：重新解题 → 执行 → 二次裁判
+# 二次验证链路
 workflow.add_edge("retry_solve", "retry_executor")
 workflow.add_edge("retry_executor", "retry_judge")
 
-# 二次裁判后：结果一致 → 结束，不一致 → HITL
+# 二次裁判后
 workflow.add_conditional_edges(
     "retry_judge",
     route_after_retry_judge,
