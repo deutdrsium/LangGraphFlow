@@ -11,6 +11,7 @@ from pydantic import BaseModel
 from langgraph.graph import StateGraph, START, END
 from langgraph.checkpoint.memory import MemorySaver
 from langchain_core.runnables import RunnableConfig
+from rate_limiter import pro_limiter, flash_limiter
 
 load_dotenv()
 client = OpenAI()
@@ -66,6 +67,9 @@ def type_classifier_node(state: GraphState):
     support_structured = os.getenv("SUPPORT_STRUCTURED_OUTPUT", "True").lower() == "true"
     
     try:
+        if flash_limiter:
+            print("[Rate Limit] Waiting for MODEL_FLASH slot (type_classifier)...", flush=True)
+            flash_limiter.acquire()
         if support_structured:
             response = client.beta.chat.completions.parse(
                 model=os.getenv("MODEL_FLASH", "gemini-3-flash-preview"),
@@ -131,6 +135,9 @@ def analyze_and_solve_node(state: GraphState, config: RunnableConfig = None):
 
     while True:
         try:
+            if pro_limiter:
+                print("[Rate Limit] Waiting for MODEL_PRO slot...", flush=True)
+                pro_limiter.acquire()
             response = client.chat.completions.create(
                 model=os.getenv("MODEL_PRO", "gemini-3.1-pro-preview"),
                 messages=[
@@ -328,6 +335,9 @@ def judge_node(state: GraphState):
     support_structured = os.getenv("SUPPORT_STRUCTURED_OUTPUT", "True").lower() == "true"
     
     try:
+        if flash_limiter:
+            print("[Rate Limit] Waiting for MODEL_FLASH slot (judge)...", flush=True)
+            flash_limiter.acquire()
         if support_structured:
             response = client.beta.chat.completions.parse(
                 model=os.getenv("MODEL_FLASH", "gemini-3-flash-preview"),

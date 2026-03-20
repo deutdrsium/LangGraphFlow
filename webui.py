@@ -8,6 +8,7 @@ import uuid
 import json
 import threading
 from collections import deque
+from rate_limiter import instance_limiter
 
 # 导入 main.py 中的相关图定义与变量
 from main import graph_app
@@ -51,6 +52,9 @@ async def get_ui():
 
 @app.post("/api/task_data")
 async def receive_task_data(data: TaskData):
+    if instance_limiter:
+        print(f"[Rate Limit] Task {data.task_id} waiting for INSTANCE slot...", flush=True)
+        await instance_limiter.async_acquire()
     print(f"\n--- New Data Received! ---")
     print(f"Task ID: {data.task_id}")
     print(f"Question Length: {len(data.question_content)} chars")
