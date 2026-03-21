@@ -8,7 +8,15 @@ import uuid
 import json
 import threading
 from collections import deque
+from dotenv import load_dotenv
+import os
 from rate_limiter import instance_limiter
+
+load_dotenv()
+
+MAX_INSTANCES = min(int(os.getenv("MAX_INSTANCES", "8")), 8)
+if MAX_INSTANCES < 1:
+    MAX_INSTANCES = 1
 
 # 导入 main.py 中的相关图定义与变量
 from main import graph_app
@@ -49,6 +57,10 @@ class HumanDecision(BaseModel):
 async def get_ui():
     with open("frontend/index.html", "r", encoding="utf-8") as f:
         return HTMLResponse(content=f.read())
+
+@app.get("/api/config")
+async def get_config():
+    return {"max_instances": MAX_INSTANCES}
 
 @app.post("/api/task_data")
 async def receive_task_data(data: TaskData):
@@ -109,7 +121,7 @@ async def get_active_sessions():
                 "status": session.get("status"),
                 "nodes": session.get("nodes", {})
             })
-    return {"sessions": active[:8]}
+    return {"sessions": active[:MAX_INSTANCES]}
 
 @app.get("/api/task_result/{task_id}")
 async def get_task_result(task_id: str):

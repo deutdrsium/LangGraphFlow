@@ -240,16 +240,8 @@
 
       return (
         <div className="flex w-full h-full overflow-hidden border flex-col">
-          <div className="flex bg-gray-100 p-1 justify-between items-center text-[10px] border-b">
-            <div>
-              <span className={`font-bold mr-2 ${sessionStatus === 'error' ? 'text-red-600' : ''}`}>State: {sessionStatus}</span>
-              {taskId && <span className="text-blue-600 truncate max-w-[100px] inline-block align-bottom">ID: {taskId}</span>}
-            </div>
-            <div className="flex items-center space-x-2">
-              <label className="flex items-center space-x-1 cursor-pointer">
-                <input type="checkbox" checked={autoMode} onChange={e => setAutoMode(e.target.checked)} />
-                <span>Auto</span>
-              </label>
+          <div className="flex bg-gray-100 p-0.5 justify-between items-center text-[10px] border-b">
+            <div className="flex items-center space-x-1">
               <button
                 className="bg-yellow-500 text-white px-1.5 rounded hover:bg-yellow-600 disabled:opacity-40"
                 disabled={sessionStatus === 'idle'}
@@ -259,7 +251,6 @@
                   try {
                     await fetch('/api/cancel_task', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ task_id: taskId }) });
                   } catch(e) {}
-                  // Wait for cancelled status to reset, then re-run
                   const wait = () => new Promise(r => setTimeout(r, 500));
                   await wait();
                   setSessionStatus('idle');
@@ -282,6 +273,14 @@
                 }}
               >取消</button>
             </div>
+            <label className="flex items-center space-x-1 cursor-pointer">
+              <input type="checkbox" checked={autoMode} onChange={e => setAutoMode(e.target.checked)} />
+              <span>Auto</span>
+            </label>
+          </div>
+          <div className="flex bg-gray-100 px-1 py-0.5 items-center text-[10px] border-b">
+            <span className={`font-bold mr-2 ${sessionStatus === 'error' ? 'text-red-600' : ''}`}>State: {sessionStatus}</span>
+            {taskId && <span className="text-blue-600 truncate max-w-[100px] inline-block align-bottom">ID: {taskId}</span>}
           </div>
           <div className="flex w-full flex-1 overflow-hidden">
             <div className="flex-1 relative">
@@ -418,6 +417,7 @@
     function App() {
       const [initialSessions, setInitialSessions] = useState([]);
       const [loaded, setLoaded] = useState(false);
+      const [maxInstances, setMaxInstances] = useState(8);
       const instanceThreadIdsRef = useRef({});
 
       const handleThreadIdChange = useCallback((instanceId, threadId) => {
@@ -429,6 +429,12 @@
       }, []);
 
       useEffect(() => {
+        fetch('/api/config').then(r => r.json()).then(d => {
+          if (d.max_instances) setMaxInstances(d.max_instances);
+        }).catch(() => {});
+      }, []);
+
+      useEffect(() => {
         const fetchActive = () => {
           fetch(`/api/active_sessions?_t=${Date.now()}`)
             .then(res => res.json())
@@ -437,20 +443,23 @@
               const claimed = instanceThreadIdsRef.current;
               const claimedSet = new Set(Object.values(claimed));
 
-              const result = new Array(8).fill(null);
+              const result = new Array(maxInstances).fill(null);
 
               // First pass: place sessions into their claimed instance slots
               for (const [idStr, tid] of Object.entries(claimed)) {
-                const session = allSessions.find(s => s.thread_id === tid);
-                if (session) {
-                  result[parseInt(idStr)] = session;
+                const idx = parseInt(idStr);
+                if (idx < maxInstances) {
+                  const session = allSessions.find(s => s.thread_id === tid);
+                  if (session) {
+                    result[idx] = session;
+                  }
                 }
               }
 
               // Second pass: distribute unclaimed sessions into empty slots
               const unclaimed = allSessions.filter(s => !claimedSet.has(s.thread_id));
               let ui = 0;
-              for (let i = 0; i < 8 && ui < unclaimed.length; i++) {
+              for (let i = 0; i < maxInstances && ui < unclaimed.length; i++) {
                 if (!result[i]) {
                   result[i] = unclaimed[ui++];
                 }
@@ -468,14 +477,18 @@
         fetchActive();
         const interval = setInterval(fetchActive, 2000);
         return () => clearInterval(interval);
-      }, [loaded]);
+      }, [loaded, maxInstances]);
 
       if (!loaded) return <div className="p-4">Loading active instances...</div>;
 
-      // Setup grid of 8 GraphInstances
+      // Layout: <=4 single row (1 row, N cols), >4 double row (2 rows, ceil(N/2) cols)
+      const gridStyle = maxInstances <= 4
+        ? { display: 'grid', gridTemplateColumns: `repeat(${maxInstances}, 1fr)`, gridTemplateRows: '1fr' }
+        : { display: 'grid', gridTemplateColumns: `repeat(${Math.ceil(maxInstances / 2)}, 1fr)`, gridTemplateRows: 'repeat(2, 1fr)' };
+
       return (
-        <div className="grid grid-cols-4 grid-rows-2 w-full h-full bg-gray-200 gap-1 p-1">
-          {Array.from({ length: 8 }).map((_, i) => (
+        <div style={gridStyle} className="w-full h-full bg-gray-200 gap-1 p-1">
+          {Array.from({ length: maxInstances }).map((_, i) => (
             <div key={i} className="bg-white rounded shadow flex flex-col h-full overflow-hidden relative">
               <div className="bg-gray-800 text-white text-xs font-bold p-1 flex justify-between">
                 <span>Instance {i + 1}</span>

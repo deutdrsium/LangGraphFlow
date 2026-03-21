@@ -41,8 +41,8 @@
     `;
     document.body.appendChild(debugPanel);
 
-    // 定义清空黑板的方法
-    window.clearIlabelBlackboard = function() {
+    // 定义清空黑板的方法（挂到 unsafeWindow，使 onclick 在页面上下文中可调用）
+    unsafeWindow.clearIlabelBlackboard = function() {
         localStorage.setItem('ilabel_active_tasks', '{}');
         console.log("🧹 [防碰撞助手] 黑板已手动清空");
         // 视觉反馈
@@ -50,8 +50,8 @@
         setTimeout(() => { debugPanel.style.borderColor = "#444"; }, 500);
     };
 
-    // 定义手动清除后台任务的方法
-    window.cancelLangGraphTask = function(taskId) {
+    // 定义手动清除后台任务的方法（挂到 unsafeWindow，使 onclick 在页面上下文中可调用）
+    unsafeWindow.cancelLangGraphTask = function(taskId) {
         console.log(`🗑️ 手动触发清空后台任务: ${taskId}`);
         GM_xmlhttpRequest({
             method: "POST",
