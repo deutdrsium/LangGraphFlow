@@ -6,6 +6,7 @@ from pydantic import BaseModel
 import uvicorn
 import uuid
 import json
+import re as _re
 import threading
 from collections import deque
 from dotenv import load_dotenv
@@ -52,6 +53,14 @@ class RunData(BaseModel):
 
 class HumanDecision(BaseModel):
     decision: str  # e.g., "Manual_Confirmed_Match" or "Manual_Overruled_Mismatch"
+
+class PhysicsTaskData(BaseModel):
+    task_id: str
+    marking: str   # JSON 字符串，如 '[["Award 0.2 pt if...", "Award 0.3 pt if..."]]'
+    model_answer: str
+
+# 物理评分会话存储（task_id -> session dict）
+physics_sessions = {}
 
 @app.get("/")
 async def get_ui():
@@ -283,6 +292,151 @@ async def resume_run(thread_id: str, data: HumanDecision):
             
     threading.Thread(target=resume_graph, daemon=True).start()
     return {"status": "success"}
+
+# ==========================================
+# 物理评分接口
+# ==========================================
+
+@app.get("/physics")
+async def get_physics_ui():
+    with open("frontend/physics.html", "r", encoding="utf-8") as f:
+        return HTMLResponse(content=f.read())
+
+@app.post("/api/physics_task")
+async def receive_physics_task(data: PhysicsTaskData):
+    """接收油猴脚本推送的物理题 marking + 模型回答，后台异步评分"""
+    physics_sessions[data.task_id] = {
+        "status": "running",
+        "marking": data.marking,
+        "model_answer": data.model_answer,
+        "result": None,
+        "error": None
+    }
+    print(f"\n--- [Physics] 收到物理评分任务: {data.task_id[:8]}... ---", flush=True)
+
+    def run_physics_grading():
+        from openai import OpenAI
+        phys_client = OpenAI()
+
+        try:
+            # 解析 marking 标准
+            criteria = []
+            raw = data.marking.strip()
+            try:
+                parsed = json.loads(raw)
+                # 支持 [["..."]] 或 ["..."] 两种嵌套格式
+                for item in parsed:
+                    if isinstance(item, list):
+                        criteria.extend(item)
+                    elif isinstance(item, str):
+                        criteria.append(item)
+            except json.JSONDecodeError:
+                # 降级：把每行当作一条评分标准
+                criteria = [line.strip() for line in raw.splitlines() if line.strip()]
+
+            if not criteria:
+                raise ValueError("未能解析出任何评分标准，请检查 marking 字段格式")
+
+            criteria_text = "\n".join(f"{i+1}. {c}" for i, c in enumerate(criteria))
+
+            system_prompt = (
+                "You are a physics exam grader. Grade the student's answer strictly based on the provided marking criteria.\n\n"
+                "For each criterion extract the point value from 'Award X pt if ...' or 'Award X marks if ...' patterns.\n"
+                "Determine whether the student's answer satisfies each criterion.\n\n"
+                "Return ONLY a valid JSON object (no markdown, no code blocks) with this exact structure:\n"
+                "{\n"
+                '  "results": [\n'
+                '    {\n'
+                '      "criterion": "<full criterion text>",\n'
+                '      "points_awarded": <number, 0 if not satisfied>,\n'
+                '      "max_points": <number, the maximum points for this criterion>,\n'
+                '      "satisfied": <true or false>,\n'
+                '      "reason": "<1-2 sentences explaining why points were or were not awarded>"\n'
+                "    }\n"
+                "  ],\n"
+                '  "total_score": <sum of points_awarded>,\n'
+                '  "score_string": "<awarded1>+<awarded2>+...=<total>, e.g. 0.2+0+0.3=0.5>"\n'
+                "}\n\n"
+                "IMPORTANT: In score_string, each position must be filled with a number (0 if not awarded, never leave blank)."
+            )
+
+            user_content = (
+                f"=== Marking Criteria ===\n{criteria_text}\n\n"
+                f"=== Student Answer ===\n{data.model_answer}"
+            )
+
+            from rate_limiter import flash_limiter
+            if flash_limiter:
+                print("[Rate Limit] Waiting for MODEL_FLASH slot (physics)...", flush=True)
+                flash_limiter.acquire()
+
+            response = phys_client.chat.completions.create(
+                model=os.getenv("MODEL_FLASH", "gemini-3-flash-preview"),
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_content}
+                ],
+                temperature=0.1
+            )
+
+            content = response.choices[0].message.content.strip()
+            # 移除可能的 markdown 代码块
+            content = _re.sub(r'^```(?:json)?\s*', '', content, flags=_re.MULTILINE)
+            content = _re.sub(r'\s*```$', '', content, flags=_re.MULTILINE)
+            content = content.strip()
+
+            result = json.loads(content)
+
+            # 确保 score_string 的每个位置都有数字（0而非空）
+            if "results" in result:
+                parts = [str(r.get("points_awarded", 0)) for r in result["results"]]
+                total = sum(r.get("points_awarded", 0) for r in result["results"])
+                result["score_string"] = "+".join(parts) + "=" + str(round(total, 4))
+                result["total_score"] = round(total, 4)
+
+            physics_sessions[data.task_id]["status"] = "finished"
+            physics_sessions[data.task_id]["result"] = result
+            print(f"[Physics] 评分完成: {data.task_id[:8]}... 总分={result.get('total_score')}", flush=True)
+
+        except Exception as e:
+            print(f"[Physics] 评分出错: {e}", flush=True)
+            physics_sessions[data.task_id]["status"] = "error"
+            physics_sessions[data.task_id]["error"] = str(e)
+
+    threading.Thread(target=run_physics_grading, daemon=True).start()
+    return {"status": "success", "message": "Physics task queued"}
+
+@app.get("/api/physics_result/{task_id}")
+async def get_physics_result(task_id: str):
+    """油猴脚本轮询：获取指定任务的评分结果"""
+    if task_id not in physics_sessions:
+        return {"status": "not_found"}
+    session = physics_sessions[task_id]
+    if session["status"] == "finished":
+        return {"status": "finished", "data": session["result"]}
+    elif session["status"] == "error":
+        return {"status": "error", "error": session.get("error", "Unknown error")}
+    return {"status": "running"}
+
+@app.get("/api/physics_sessions")
+async def get_physics_sessions():
+    """WebUI 获取所有物理评分会话（最多返回最近 50 条）"""
+    result = []
+    for task_id, session in physics_sessions.items():
+        result.append({
+            "task_id": task_id,
+            "status": session["status"],
+            "result": session.get("result"),
+            "error": session.get("error")
+        })
+    return {"sessions": result[-50:]}
+
+@app.post("/api/physics_clear")
+async def clear_physics_sessions():
+    """WebUI 清空所有物理评分记录"""
+    physics_sessions.clear()
+    return {"status": "success"}
+
 
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=8001, access_log=False)
