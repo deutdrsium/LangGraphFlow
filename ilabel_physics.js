@@ -422,7 +422,7 @@
                     if (m) dbg('subQId', `通过父元素合并文本匹配: "${node.parentElement?.textContent?.trim()}"`);
                 }
                 if (m) {
-                    dbg('subQId', `匹配"标注中"格式成功: → ${m[1]}_${m[2]}`);
+                    dbg('subQId', `匹配"标注中/修改中"格式成功: → ${m[1]}_${m[2]}`);
                     return `${m[1]}_${m[2]}`;
                 }
             }
