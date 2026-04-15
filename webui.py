@@ -349,15 +349,22 @@ async def receive_physics_task(data: PhysicsTaskData):
                 '    {\n'
                 '      "criterion": "<full criterion text>",\n'
                 '      "points_awarded": <number, 0 if not satisfied>,\n'
-                '      "max_points": <number, the maximum points for this criterion>,\n'
                 '      "satisfied": <true or false>,\n'
-                '      "reason": "<1-2 sentences explaining why points were or were not awarded>"\n'
+                '      "matched_text": "<exact substring from student answer, or null>"\n'
                 "    }\n"
                 "  ],\n"
                 '  "total_score": <sum of points_awarded>,\n'
-                '  "score_string": "<awarded1>+<awarded2>+...=<total>, e.g. 0.2+0+0.3=0.5>"\n'
+                '  "score_string": "<awarded1>+<awarded2>+...=<total>, e.g. 0.2+0+0.3=0.5>",\n'
+                '  "note": "<≤20 Chinese characters, or null>"\n'
                 "}\n\n"
-                "IMPORTANT: In score_string, each position must be filled with a number (0 if not awarded, never leave blank)."
+                "IMPORTANT: In score_string, each position must be filled with a number (0 if not awarded, never leave blank).\n"
+                "For the note field: set it ONLY when the student solved the problem using a fundamentally different method or approach than what the marking criteria describe (e.g. used energy method instead of Newton's laws). Set to null in all other cases — including partial credit, wrong answers, or minor phrasing differences.\n"
+                "CRITICAL for matched_text:\n"
+                "  - You MUST copy a substring that appears CHARACTER-FOR-CHARACTER in the student answer.\n"
+                "  - NEVER abbreviate, NEVER use '...', NEVER paraphrase, NEVER omit any characters.\n"
+                "  - If the evidence spans a formula (e.g. $$...$$), copy the ENTIRE formula from its opening $$ to its closing $$.\n"
+                "  - Ideal length is 15–60 characters — enough to be uniquely identifiable but no longer.\n"
+                "  - Use null when the criterion is not satisfied."
             )
 
             user_content = (
@@ -370,22 +377,80 @@ async def receive_physics_task(data: PhysicsTaskData):
                 print("[Rate Limit] Waiting for MODEL_FLASH slot (physics)...", flush=True)
                 flash_limiter.acquire()
 
-            response = phys_client.chat.completions.create(
-                model=os.getenv("MODEL_FLASH", "gemini-3-flash-preview"),
-                messages=[
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": user_content}
-                ],
-                temperature=0.1
-            )
+            import time as _time
+            model_name = os.getenv("MODEL_FLASH", "gemini-3-flash-preview")
+            print(f"[Physics][DBG] base_url={phys_client.base_url}  model={model_name}", flush=True)
+            print(f"[Physics][DBG] system_prompt={len(system_prompt)}字  user_content={len(user_content)}字", flush=True)
+            print(f"[Physics] 调用模型（非流式，心跳每2s输出一次）...", flush=True)
 
-            content = response.choices[0].message.content.strip()
+            # 无限重试，每次超时限制 120 秒
+            _TIMEOUT_SEC = 120
+            content = None
+            _attempt = 0
+
+            while True:
+                _attempt += 1
+                print(f"[Physics] 第{_attempt}次流式调用（timeout={_TIMEOUT_SEC}s）...", flush=True)
+                try:
+                    t_start = _time.time()
+                    content_parts = []
+                    first_chunk = True
+                    with phys_client.chat.completions.create(
+                        model=model_name,
+                        messages=[
+                            {"role": "system", "content": system_prompt},
+                            {"role": "user", "content": user_content}
+                        ],
+                        temperature=0.1,
+                        stream=True,
+                        timeout=_TIMEOUT_SEC
+                    ) as stream:
+                        for chunk in stream:
+                            if first_chunk:
+                                print(f"[Physics][DBG] 首个chunk，耗时={_time.time()-t_start:.1f}s", flush=True)
+                                first_chunk = False
+                            delta = chunk.choices[0].delta.content if chunk.choices else None
+                            if delta:
+                                print(delta, end="", flush=True)
+                                content_parts.append(delta)
+
+                    elapsed = _time.time() - t_start
+                    print(f"\n[Physics][DBG] 流结束（第{_attempt}次），耗时={elapsed:.1f}s，共{sum(len(p) for p in content_parts)}字", flush=True)
+                    content = "".join(content_parts)
+                    break  # 成功，退出重试循环
+                except Exception as api_err:
+                    print(f"\n[Physics][DBG] 第{_attempt}次调用失败: {type(api_err).__name__}: {api_err}", flush=True)
+                    print(f"[Physics] 3秒后重试（第{_attempt + 1}次）...", flush=True)
+                    _time.sleep(3)
+
+            content = content or ""
+            content = content.strip()
+            print(f"[Physics][DBG] 原始响应长度={len(content)}字", flush=True)
+            print(f"[Physics] 响应内容：\n{'─'*60}\n{content}\n{'─'*60}", flush=True)
+            # 用 repr 打出原始字节，避免终端渲染 \r\n 等控制字符造成误判
+            print(f"[Physics][DBG] 原始内容 repr（前300字）: {repr(content[:300])}", flush=True)
+
             # 移除可能的 markdown 代码块
             content = _re.sub(r'^```(?:json)?\s*', '', content, flags=_re.MULTILINE)
             content = _re.sub(r'\s*```$', '', content, flags=_re.MULTILINE)
             content = content.strip()
 
-            result = json.loads(content)
+            # 修复模型输出的非法 JSON 转义序列（如 \p \a \m 等 LaTeX 命令）
+            # JSON 合法转义：\" \\ \/ \b \f \n \r \t \uXXXX，其余均需补全为 \\
+            # (?<!\\) 负向前瞻：跳过已被转义的反斜杠（即 \\ 的第二个 \），避免把合法的 \\pi 破坏成 \\\pi
+            content_before = content
+            content = _re.sub(r'(?<!\\)\\(?!["\\/bfnrtu])', r'\\\\', content)
+            if content != content_before:
+                print(f"[Physics][DBG] regex 修正了转义序列，处理后 repr（前300字）: {repr(content[:300])}", flush=True)
+
+            try:
+                result = json.loads(content)
+            except json.JSONDecodeError as jde:
+                ctx_s = max(0, jde.pos - 60)
+                ctx_e = min(len(content), jde.pos + 60)
+                print(f"[Physics][DBG] json.loads 失败: {jde}", flush=True)
+                print(f"[Physics][DBG] 出错位置 pos={jde.pos} 前后内容 repr: {repr(content[ctx_s:ctx_e])}", flush=True)
+                raise
 
             # 确保 score_string 的每个位置都有数字（0而非空）
             if "results" in result:
@@ -435,6 +500,35 @@ async def get_physics_sessions():
 async def clear_physics_sessions():
     """WebUI 清空所有物理评分记录"""
     physics_sessions.clear()
+    return {"status": "success"}
+
+
+# ==========================================
+# 返修队列接口
+# ==========================================
+
+class RevisionData(BaseModel):
+    tasks: list  # [{processKey, taskId, subQId, failedCriteria, timestamp}]
+
+revision_queue: list = []
+
+@app.post("/api/physics_revision")
+async def submit_revision(data: RevisionData):
+    """油猴脚本推送标注失败的题目到返修队列"""
+    for item in data.tasks:
+        revision_queue.append(item)
+    print(f"[Revision] 收到 {len(data.tasks)} 条返修请求，队列总计 {len(revision_queue)} 条", flush=True)
+    return {"status": "success", "count": len(data.tasks), "total": len(revision_queue)}
+
+@app.get("/api/physics_revision")
+async def get_revision_queue():
+    """查看当前返修队列"""
+    return {"queue": revision_queue, "total": len(revision_queue)}
+
+@app.delete("/api/physics_revision")
+async def clear_revision_queue():
+    """清空返修队列"""
+    revision_queue.clear()
     return {"status": "success"}
 
 
