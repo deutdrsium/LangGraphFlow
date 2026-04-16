@@ -784,7 +784,150 @@
                 }
             }
 
-            dbgErr('spanRange', `所有匹配均失败 → "${textToFind.substring(0, 80)}"`);
+            // ─── 策略6：LaTeX 命令变体匹配 ──────────────────────────────────────
+            // LLM 有时将 \dfrac 写成 \frac，\mathrm 写成 \text，或多写 \displaystyle 等
+            // 生成多种归一化变体后逐一在 normFull 中精确/折叠空白搜索
+            {
+                const normTF = textToFind.replace(/\s+/g, ' ').trim();
+                const laVariants = new Set();
+                const addVariants = (s) => {
+                    laVariants.add(s.replace(/\\dfrac/g,  '\\frac').replace(/\\tfrac/g, '\\frac'));
+                    laVariants.add(s.replace(/\\frac/g,   '\\dfrac'));
+                    laVariants.add(s.replace(/\\text\{/g, '\\mathrm{'));
+                    laVariants.add(s.replace(/\\mathrm\{/g, '\\text{'));
+                    laVariants.add(s.replace(/\\displaystyle\s*/g, '').replace(/\s+/g, ' ').trim());
+                    laVariants.add(s.replace(/\\limits/g, ''));
+                    laVariants.add(s.replace(/_\{([a-zA-Z0-9])\}/g, '_$1'));   // _{x} → _x
+                    laVariants.add(s.replace(/_([a-zA-Z])\b/g,       '_{$1}')); // _x  → _{x}
+                };
+                addVariants(normTF);
+                addVariants(normSearch); // normSearch 已折叠空白
+                laVariants.delete(normTF);
+                laVariants.delete(normSearch);
+                laVariants.delete('');
+
+                for (const variant of laVariants) {
+                    if (variant.length < 5) continue;
+                    const vNorm = variant.replace(/\s+/g, ' ').trim();
+                    const vIdx = normFull.indexOf(vNorm);
+                    if (vIdx < 0) continue;
+                    let origStart = -1, origEnd = -1, np = 0;
+                    for (let i = 0; i < fullText.length; i++) {
+                        const c = fullText[i];
+                        if (np === vIdx && origStart < 0) origStart = i;
+                        if (np === vIdx + vNorm.length - 1) { origEnd = i; break; }
+                        if (/\s/.test(c)) {
+                            if (np < normFull.length && normFull[np] === ' ') {
+                                np++;
+                                while (i + 1 < fullText.length && /\s/.test(fullText[i + 1])) i++;
+                            }
+                        } else { np++; }
+                    }
+                    if (origStart >= 0 && origEnd >= 0) {
+                        origEnd = extendEnd(origEnd);
+                        dbg('spanRange', `LaTeX变体匹配 ✓ variant="${vNorm.substring(0, 40)}" → [${origStart}-${origEnd}]`);
+                        return { start: origStart, end: origEnd, spans };
+                    }
+                }
+                dbg('spanRange', 'LaTeX变体匹配全部失败');
+            }
+
+            // ─── 策略7：唯一子串锚点定位 ─────────────────────────────────────────
+            // 在 normSearch 中寻找一个在 normFull 里只出现一次的子串，用来精确定位起始位置
+            // 适用于 LLM 在格式细节上有多处差异，但公式中某段连续字符在文本中唯一存在的情况
+            {
+                const anchorLens = [20, 16, 12, 9, 7];
+                for (const alen of anchorLens) {
+                    if (normSearch.length < alen) continue;
+                    const scanStep = Math.max(1, Math.floor(normSearch.length / 12));
+                    for (let off = 0; off <= normSearch.length - alen; off += scanStep) {
+                        const anchor = normSearch.substring(off, off + alen).trim();
+                        if (anchor.length < 5) continue;
+                        const fi = normFull.indexOf(anchor);
+                        if (fi < 0) continue;
+                        if (normFull.indexOf(anchor, fi + 1) >= 0) continue; // 不唯一，跳过
+
+                        // 用锚点偏移量估算 normFull 中的起止范围
+                        const normEstStart = Math.max(0, fi - off);
+                        const normEstEnd   = Math.min(normFull.length - 1, normEstStart + normSearch.length - 1);
+
+                        let origStart = -1, origEnd = -1, np = 0;
+                        for (let i = 0; i < fullText.length; i++) {
+                            const c = fullText[i];
+                            if (np === normEstStart && origStart < 0) origStart = i;
+                            if (np === normEstEnd) { origEnd = i; break; }
+                            if (/\s/.test(c)) {
+                                if (np < normFull.length && normFull[np] === ' ') {
+                                    np++;
+                                    while (i + 1 < fullText.length && /\s/.test(fullText[i + 1])) i++;
+                                }
+                            } else { np++; }
+                        }
+                        if (origEnd < 0 && origStart >= 0)
+                            origEnd = Math.min(origStart + normSearch.length - 1, spans.length - 1);
+                        if (origStart >= 0 && origEnd >= 0) {
+                            origEnd = extendEnd(origEnd);
+                            dbg('spanRange', `唯一锚点匹配 ✓ anchor="${anchor}" off=${off} → [${origStart}-${origEnd}]`);
+                            return { start: origStart, end: origEnd, spans };
+                        }
+                    }
+                }
+                dbg('spanRange', '唯一锚点匹配失败');
+            }
+
+            // ─── 策略8：Bigram 最优滑动窗口（终极兜底，不可能失败）────────────────
+            // 以 normSearch.length 为窗口长度在 normFull 上滑动，用 bigram 重叠率
+            // 选出得分最高的位置。即使得分很低也会返回（总比漏标注好），
+            // 并在悬浮窗标注"低置信度，请人工复核"。
+            {
+                const winLen = Math.min(normSearch.length, normFull.length);
+                if (winLen >= 2) {
+                    // 建立 normSearch 的 bigram 集合
+                    const bigrams = new Set();
+                    for (let bi = 0; bi < normSearch.length - 1; bi++)
+                        bigrams.add(normSearch.substring(bi, bi + 2));
+
+                    let bestScore = -1, bestNormStart = 0;
+                    const bStep = Math.max(1, Math.floor(winLen / 60));
+
+                    for (let wi = 0; wi <= normFull.length - winLen; wi += bStep) {
+                        let matches = 0;
+                        const window = normFull.substring(wi, wi + winLen);
+                        for (let bj = 0; bj < window.length - 1; bj++) {
+                            if (bigrams.has(window.substring(bj, bj + 2))) matches++;
+                        }
+                        const score = bigrams.size > 0 ? matches / bigrams.size : 0;
+                        if (score > bestScore) { bestScore = score; bestNormStart = wi; }
+                    }
+
+                    const bestNormEnd = Math.min(bestNormStart + winLen - 1, normFull.length - 1);
+
+                    // 将 normFull 位置映射回 fullText
+                    let origStart = -1, origEnd = -1, np = 0;
+                    for (let i = 0; i < fullText.length; i++) {
+                        const c = fullText[i];
+                        if (np === bestNormStart && origStart < 0) origStart = i;
+                        if (np === bestNormEnd) { origEnd = i; break; }
+                        if (/\s/.test(c)) {
+                            if (np < normFull.length && normFull[np] === ' ') {
+                                np++;
+                                while (i + 1 < fullText.length && /\s/.test(fullText[i + 1])) i++;
+                            }
+                        } else { np++; }
+                    }
+                    if (origStart < 0) origStart = 0;
+                    if (origEnd   < 0) origEnd = Math.min(origStart + normSearch.length - 1, spans.length - 1);
+                    origEnd = Math.min(origEnd, spans.length - 1);
+
+                    const conf = bestScore > 0.7 ? '高' : bestScore > 0.4 ? '中' : '低';
+                    dbgWarn('spanRange', `兜底Bigram匹配 置信度:${conf}(${(bestScore * 100).toFixed(0)}%) → [${origStart}-${origEnd}]`);
+                    log(`⚠ 兜底匹配(置信度${conf})，此条标注请人工复核`);
+                    return { start: origStart, end: origEnd, spans };
+                }
+            }
+
+            // winLen < 2 时唯一会走到这里（正常情况不会发生）
+            dbgErr('spanRange', `所有策略均失败(textToFind过短?) → "${textToFind.substring(0, 80)}"`);
             return null;
         }
 
