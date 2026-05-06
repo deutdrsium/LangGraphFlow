@@ -49,6 +49,15 @@
         const PHYS_REVISION_MODE_KEY  = 'ilabel_phys_revision_mode';
         const PHYS_REVISION_QUEUE_KEY = 'ilabel_phys_revision_queue';
 
+        // 手动发送模式（localStorage 跨标签页共享）
+        const PHYS_MANUAL_SEND_KEY = 'ilabel_phys_manual_send';
+        function getManualSendMode() { return _pageLS.getItem(PHYS_MANUAL_SEND_KEY) === 'true'; }
+        function setManualSendMode(val) { _pageLS.setItem(PHYS_MANUAL_SEND_KEY, val ? 'true' : 'false'); }
+
+        // 手动发送模式：当前已提取但尚未发送的任务（per-tab，不共享）
+        let pendingTask      = null; // { apiTaskId, marking, nerText, subQId, taskId, processKey }
+        let pendingExtractKey = null; // 防止主循环对同一子题重复提取
+
         function getRevisionMode() {
             return _pageLS.getItem(PHYS_REVISION_MODE_KEY) === 'true';
         }
@@ -140,6 +149,49 @@
                 log('返修队列已清空');
                 updateStatus('返修队列清空');
             };
+
+            // 手动发送模式开关
+            _win.togglePhysManualSendMode = function () {
+                const newMode = !getManualSendMode();
+                setManualSendMode(newMode);
+                if (!newMode) { pendingTask = null; pendingExtractKey = null; } // 关闭时清除待发送任务
+                log(newMode ? '⏸ 手动发送模式已开启' : '▶ 手动发送模式已关闭（自动发送）');
+                updateStatus(newMode ? '手动发送: 开' : '手动发送: 关');
+            };
+
+            // 发送当前待发送任务到后端
+            _win.sendPendingTask = async function () {
+                if (!pendingTask) { log('无待发送的题目'); return; }
+                if (isProcessing) { log('⚠ 正在处理中，请稍候'); return; }
+
+                const task = Object.assign({}, pendingTask);
+                pendingTask       = null;
+                pendingExtractKey = null;
+
+                const collider = checkPhysCollision(task.processKey);
+                if (collider) { log(`⚠ 与 ${collider} 冲突，无法发送`); return; }
+
+                registerPhysTask(task.processKey);
+                isProcessing = true;
+                updateStatus(`发送中: ${task.subQId}`);
+                try {
+                    await executeAnnotationFlow(task);
+                } catch (e) {
+                    log('发送出错: ' + e.message);
+                    console.error('[物理划词]', e);
+                } finally {
+                    releasePhysTask();
+                    isProcessing = false;
+                }
+            };
+
+            // 清除待发送任务
+            _win.clearPendingTask = function () {
+                pendingTask       = null;
+                pendingExtractKey = null;
+                log('待发送任务已清除');
+                updateStatus('待发送任务已清除');
+            };
         } catch (_) {}
 
         // ==========================================
@@ -200,8 +252,12 @@
 
             const _revMode  = getRevisionMode();
             const _revQueue = getRevisionQueue();
+            const _manMode  = getManualSendMode();
             const revBtnStyle = _revMode
                 ? 'cursor:pointer;background:#e67e22;color:white;border:none;padding:2px 8px;border-radius:4px;font-size:11px;'
+                : 'cursor:pointer;background:#2c3e50;color:#ccc;border:1px solid #555;padding:2px 8px;border-radius:4px;font-size:11px;';
+            const manBtnStyle = _manMode
+                ? 'cursor:pointer;background:#8e44ad;color:white;border:none;padding:2px 8px;border-radius:4px;font-size:11px;'
                 : 'cursor:pointer;background:#2c3e50;color:#ccc;border:1px solid #555;padding:2px 8px;border-radius:4px;font-size:11px;';
             const revSendHtml = (_revMode && _revQueue.length > 0) ? `
                 <div style="margin-top:5px;display:flex;gap:4px;">
@@ -213,6 +269,22 @@
                         style="cursor:pointer;background:#7f8c8d;color:white;border:none;padding:3px 6px;border-radius:4px;font-size:11px;">
                         清空
                     </button>
+                </div>` : '';
+            const pendingHtml = pendingTask ? `
+                <div style="margin-top:6px;padding:6px 8px;background:#1a0a35;border-radius:5px;border:1px solid #8e44ad;">
+                    <div style="color:#c39bd3;font-size:11px;margin-bottom:4px;">
+                        ⏸ 待发送: <span style="color:white">${pendingTask.subQId}</span>
+                    </div>
+                    <div style="display:flex;gap:4px;">
+                        <button onclick="window.sendPendingTask&&window.sendPendingTask()"
+                            style="cursor:pointer;background:#8e44ad;color:white;border:none;padding:3px 0;border-radius:4px;font-size:11px;flex:1;font-weight:bold;">
+                            📤 发送
+                        </button>
+                        <button onclick="window.clearPendingTask&&window.clearPendingTask()"
+                            style="cursor:pointer;background:#7f8c8d;color:white;border:none;padding:3px 6px;border-radius:4px;font-size:11px;">
+                            ✕
+                        </button>
+                    </div>
                 </div>` : '';
 
             debugPanel.innerHTML = `
@@ -229,13 +301,17 @@
                 <span style="color:#AAA;font-size:11px;">黑板:</span><br>${boardHtml}<br>
                 <span style="color:#FF9F43">▶ ${msg || ''}</span>
                 <hr style="border-color:#1a3a6a;margin:4px 0;">
-                <div style="display:flex;justify-content:space-between;align-items:center;">
+                <div style="display:flex;gap:4px;flex-wrap:wrap;">
                     <button onclick="window.togglePhysRevisionMode&&window.togglePhysRevisionMode()" style="${revBtnStyle}">
-                        ${_revMode ? '⚠ 返修模式: 开' : '⚪ 返修模式: 关'}
+                        ${_revMode ? '⚠ 返修: 开' : '⚪ 返修: 关'}
                     </button>
-                    ${_revMode ? `<span style="color:#FF9F43;font-size:11px;">队列: ${_revQueue.length} 项</span>` : ''}
+                    <button onclick="window.togglePhysManualSendMode&&window.togglePhysManualSendMode()" style="${manBtnStyle}">
+                        ${_manMode ? '⏸ 手动发送: 开' : '▶ 手动发送: 关'}
+                    </button>
+                    ${_revMode ? `<span style="color:#FF9F43;font-size:11px;align-self:center;">队列: ${_revQueue.length}</span>` : ''}
                 </div>
                 ${revSendHtml}
+                ${pendingHtml}
             `;
         }
 
@@ -338,11 +414,11 @@
                 if (!t) continue;
                 checkedCount++;
                 // 先尝试单节点完整匹配
-                let m = t.match(/标注中[（(](\d+)\s*[\/／]\s*(\d+)[）)]/);
-                if (!m && t.includes('标注中')) {
-                    // "标注中" 与 "(N / M)" 是同父元素下的两个独立文本节点，合并父元素文本再匹配
+                let m = t.match(/(?:标注中|修改中)[（(](\d+)\s*[\/／]\s*(\d+)[）)]/);
+                if (!m && (t.includes('标注中') || t.includes('修改中'))) {
+                    // "标注中"/"修改中" 与 "(N / M)" 是同父元素下的两个独立文本节点，合并父元素文本再匹配
                     const parentText = (node.parentElement?.textContent || '').replace(/\s+/g, '');
-                    m = parentText.match(/标注中[（(](\d+)[\/／](\d+)[）)]/);
+                    m = parentText.match(/(?:标注中|修改中)[（(](\d+)[\/／](\d+)[）)]/);
                     if (m) dbg('subQId', `通过父元素合并文本匹配: "${node.parentElement?.textContent?.trim()}"`);
                 }
                 if (m) {
@@ -350,7 +426,7 @@
                     return `${m[1]}_${m[2]}`;
                 }
             }
-            dbgWarn('subQId', `未找到"标注中(...)"文本节点，共扫描 ${checkedCount} 个非空节点`);
+            dbgWarn('subQId', `未找到"标注中/修改中(...)"文本节点，共扫描 ${checkedCount} 个非空节点`);
 
             // 降级：原 Q-Part 格式
             const pattern = /Q\d+-Part\s+[A-Z][-–][A-Z]\.\d+/;
@@ -364,7 +440,7 @@
                     return t;
                 }
             }
-            dbgErr('subQId', '完全失败，返回 null。请检查页面是否有"标注中(N/M)"或 Q-Part 文本');
+            dbgErr('subQId', '完全失败，返回 null。请检查页面是否有"标注中(N/M)"/"修改中(N/M)"或 Q-Part 文本');
             return null;
         }
 
@@ -375,10 +451,10 @@
             while ((node = walker.nextNode())) {
                 const t = node.nodeValue.trim();
                 if (!t) continue;
-                let m = t.match(/标注中[（(](\d+)\s*[\/／]\s*(\d+)[）)]/);
-                if (!m && t.includes('标注中')) {
+                let m = t.match(/(?:标注中|修改中)[（(](\d+)\s*[\/／]\s*(\d+)[）)]/);
+                if (!m && (t.includes('标注中') || t.includes('修改中'))) {
                     const parentText = (node.parentElement?.textContent || '').replace(/\s+/g, '');
-                    m = parentText.match(/标注中[（(](\d+)[\/／](\d+)[）)]/);
+                    m = parentText.match(/(?:标注中|修改中)[（(](\d+)[\/／](\d+)[）)]/);
                 }
                 if (m) {
                     const idx = parseInt(m[1]) - 1;
@@ -932,6 +1008,27 @@
         }
 
         /**
+         * 读取"标注结果："区域当前已有的标注项数量。
+         * 找到 ant-descriptions-item-label 中含"标注结果"的那个，
+         * 取其所在行的 ant-descriptions-item-content 的 childElementCount。
+         * 找不到时返回 -1（调用方退化为弹窗关闭检测）。
+         */
+        function getAnnotationCount() {
+            // "标注结果" 文本在 ant-descriptions-title（header区域），
+            // 实际标注项是同级 ant-descriptions-view 下每个 ant-tag 元素。
+            const titles = document.querySelectorAll('.ant-descriptions-title');
+            for (const title of titles) {
+                if (title.textContent.includes('标注结果')) {
+                    const container = title.closest('.ant-descriptions');
+                    if (container) {
+                        return container.querySelectorAll('.ant-tag').length;
+                    }
+                }
+            }
+            return -1;
+        }
+
+        /**
          * 对指定 span 范围执行：选中 → 双击 → 等弹窗 → 输入分值 → 关闭
          * @param {Element} nerContainer
          * @param {number} startIdx
@@ -945,6 +1042,8 @@
                 log(`span 索引越界: ${startIdx}-${endIdx}，总数 ${spans.length}`);
                 return false;
             }
+            // 在任何 DOM 操作前快照"标注结果"区域的子元素数，用于 Step 8 成功验证
+            const countBefore = getAnnotationCount();
 
             const startSpan = spans[startIdx];
             const endSpan   = spans[endIdx];
@@ -978,11 +1077,26 @@
 
             // Step 3: dblclick 触发 iLabel 弹窗（可能先出现快捷键提示，再出现标注输入框）
             const midRect = midSpan.getBoundingClientRect();
+            // 保存 Range 快照：dblclick 会触发浏览器词选，覆盖我们精确设置的选区
+            let savedRange = null;
+            try {
+                const sel = window.getSelection();
+                if (sel && sel.rangeCount > 0) savedRange = sel.getRangeAt(0).cloneRange();
+            } catch (_) {}
             midSpan.dispatchEvent(new MouseEvent('dblclick', {
                 bubbles: true, cancelable: true, button: 0,
                 clientX: midRect.left + 2, clientY: midRect.top + 2
             }));
-            await sleep(350);
+            await sleep(10); // 让 dblclick 同步处理器先运行
+            // 恢复精确 Range，覆盖浏览器自动词选
+            try {
+                if (savedRange) {
+                    const sel = window.getSelection();
+                    sel.removeAllRanges();
+                    sel.addRange(savedRange);
+                }
+            } catch (_) {}
+            await sleep(340); // 凑足原来的 350ms
 
             // Step 4: 若出现"Ctrl+C / Enter"快捷键提示框，自动按 Enter 进入标注弹窗
             const hint = findShortcutHintPopup();
@@ -1048,25 +1162,86 @@
             popup.closeBtn.click();
             await sleep(1500);
 
-            // Step 8: 验证弹窗已关闭（元素从 DOM 移除或宽高归零均视为关闭成功）
-            const popupClosed = !document.contains(popup.container) ||
-                popup.container.getBoundingClientRect().width === 0;
-            if (!popupClosed) {
-                dbgWarn('annotate', '弹窗关闭后仍然可见，标注可能未保存');
-                return false;
+            // Step 8: 验证标注是否落盘
+            // 主检测：比较"标注结果："区域子元素数（更可靠）
+            const countAfter = getAnnotationCount();
+            if (countBefore >= 0) {
+                if (countAfter > countBefore) {
+                    dbg('annotate', `✓ 标注落盘确认（标注项数 ${countBefore} → ${countAfter}），scoreValue=${scoreValue}`);
+                    log(`✓ 已标注分值 ${scoreValue}`);
+                    return true;
+                } else {
+                    // 数量未增加：可能是重复标注（RULE 6），也可能真的失败了
+                    // 退化：检查弹窗是否已关闭，关闭则仍视为成功（防止重复标注被误报为失败）
+                    const popupClosed = !document.contains(popup.container) ||
+                        popup.container.getBoundingClientRect().width === 0;
+                    if (popupClosed) {
+                        dbg('annotate', `弹窗已关闭，标注项数未增加（${countBefore} → ${countAfter}），视为成功（多条标注指向同一文本）`);
+                        log(`✓ 已标注分值 ${scoreValue}`);
+                        return true;
+                    } else {
+                        dbgWarn('annotate', `弹窗未关闭且标注项数未增加（${countBefore} → ${countAfter}），标注失败`);
+                        return false;
+                    }
+                }
+            } else {
+                // 找不到"标注结果"区域，退化为旧的弹窗关闭检测
+                const popupClosed = !document.contains(popup.container) ||
+                    popup.container.getBoundingClientRect().width === 0;
+                if (!popupClosed) {
+                    dbgWarn('annotate', '弹窗关闭后仍然可见，标注可能未保存（DOM计数不可用）');
+                    return false;
+                }
+                dbg('annotate', `✓ 标注完成（退化：弹窗关闭确认），scoreValue=${scoreValue}`);
+                log(`✓ 已标注分值 ${scoreValue}`);
+                return true;
             }
-
-            dbg('annotate', `✓ 标注完成，scoreValue=${scoreValue}`);
-            log(`✓ 已标注分值 ${scoreValue}`);
-            return true;
         }
 
         // ==========================================
         // 9. 标注流程编排
         // ==========================================
 
-        async function annotateOneCriterion(result, criterionIndex) {
+        /**
+         * 检查 matchedText 是否为 nerText 的逐字连续子串。
+         *   'exact'  → matchedText 本身就在 nerText 里，直接使用
+         *   'lcs'    → 最长公共子串 ≥ minLen，用 .text 替换后继续
+         *   'retry'  → 无足够长的公共子串，需重新请求 API
+         */
+        function extractVerbatimMatch(matchedText, nerText, minLen = 10) {
+            if (!matchedText || !nerText) return { status: 'retry', text: '' };
+            if (nerText.includes(matchedText)) return { status: 'exact', text: matchedText };
+
+            // 从最长到最短扫描所有连续子串，找到第一个（即最长）存在于 nerText 的子串
+            for (let len = matchedText.length - 1; len >= minLen; len--) {
+                for (let start = 0; start + len <= matchedText.length; start++) {
+                    const sub = matchedText.substring(start, start + len);
+                    if (nerText.includes(sub)) {
+                        return { status: 'lcs', text: sub };
+                    }
+                }
+            }
+            return { status: 'retry', text: '' };
+        }
+
+        async function annotateOneCriterion(result, criterionIndex, nerText) {
             if (!result.satisfied || !result.matched_text) return false;
+
+            // ── 逐字预检：确保 matched_text 是 nerText 的连续子串 ──
+            if (nerText) {
+                const vm = extractVerbatimMatch(result.matched_text, nerText);
+                if (vm.status === 'retry') {
+                    dbgWarn('verbatim', `[${criterionIndex + 1}] matched_text 与原文无足够公共子串，标记重试`);
+                    log(`⚠ [${criterionIndex + 1}] matched_text 与原文不匹配，需重新请求 API`);
+                    return 'NEEDS_RETRY';
+                }
+                if (vm.status === 'lcs') {
+                    dbg('verbatim', `[${criterionIndex + 1}] 非逐字，裁剪至最长公共子串(${vm.text.length}字): "${vm.text.substring(0, 50)}"`);
+                    log(`[${criterionIndex + 1}] 自动裁剪: "${vm.text.substring(0, 40)}..."`);
+                    result = { ...result, matched_text: vm.text };
+                }
+                // status === 'exact' → 无需修改，直接继续
+            }
 
             const nerContainer = getNerContainer();
             if (!nerContainer) { log('未找到NER容器'); return false; }
@@ -1080,6 +1255,62 @@
                 return false;
             }
 
+            // ── 边界精修：用首尾6字锚点修正偏移量估算导致的多余/缺失字符 ──
+            let { start, end, spans: allSpans } = spanRange;
+            const spansArr = Array.from(allSpans);
+            // rawJoin: 每个 span 对应一个字符，字符位置与 span 下标直接对应
+            const rawJoin = (s, e) => spansArr.slice(s, e + 1).map(sp => sp.textContent).join('');
+            const MAX_TRIM = 12; // 最多修剪/扩展的 span 数
+
+            // ── 首部校正 ──
+            const headAnchor = matchedText.slice(0, Math.min(6, matchedText.length));
+            if (headAnchor) {
+                const cov = rawJoin(start, end);
+                if (!cov.startsWith(headAnchor)) {
+                    const idx = cov.indexOf(headAnchor);
+                    if (idx > 0 && idx <= MAX_TRIM) {
+                        // 覆盖了多余的开头字符 → 向右裁剪
+                        start += idx;
+                        dbg('boundary', `首部多余 ${idx} 格，start → ${start}  anchor="${headAnchor}"`);
+                    } else if (idx < 0) {
+                        // 目标开头不在当前覆盖范围 → 向左扩展最多2格
+                        const extStart = Math.max(0, start - 2);
+                        const extCov = rawJoin(extStart, end);
+                        const extIdx = extCov.indexOf(headAnchor);
+                        if (extIdx >= 0 && extIdx <= 2) {
+                            start = extStart + extIdx;
+                            dbg('boundary', `首部缺失，start 扩展至 ${start}`);
+                        }
+                    }
+                }
+            }
+
+            // ── 尾部校正 ──
+            const tailAnchor = matchedText.slice(Math.max(0, matchedText.length - 6));
+            if (tailAnchor) {
+                const cov = rawJoin(start, end);
+                if (!cov.endsWith(tailAnchor)) {
+                    const idx = cov.lastIndexOf(tailAnchor);
+                    if (idx >= 0) {
+                        const extra = cov.length - (idx + tailAnchor.length);
+                        if (extra > 0 && extra <= MAX_TRIM) {
+                            // 覆盖了多余的结尾字符 → 向左裁剪
+                            end -= extra;
+                            end = Math.max(start, end);
+                            dbg('boundary', `尾部多余 ${extra} 格，end → ${end}  anchor="${tailAnchor}"`);
+                        }
+                    } else {
+                        // 目标结尾不在当前覆盖范围 → 向右扩展最多2格
+                        const extEnd = Math.min(spansArr.length - 1, end + 2);
+                        const extCov = rawJoin(start, extEnd);
+                        if (extCov.endsWith(tailAnchor)) {
+                            end = extEnd;
+                            dbg('boundary', `尾部缺失，end 扩展至 ${end}`);
+                        }
+                    }
+                }
+            }
+
             const scoreValue = result.points_awarded;
             const MAX_RETRIES = 2;
             for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
@@ -1087,9 +1318,9 @@
                     log(`⚠ [${criterionIndex + 1}] 第${attempt}次重试标注...`);
                     await sleep(1200);
                 }
-                const ok = await annotateSpanRange(nerContainer, spanRange.start, spanRange.end, scoreValue);
+                const ok = await annotateSpanRange(nerContainer, start, end, scoreValue);
                 if (ok) {
-                    log(`✓ [${criterionIndex + 1}] 标注完成，分值=${scoreValue} (span ${spanRange.start}-${spanRange.end})`);
+                    log(`✓ [${criterionIndex + 1}] 标注完成，分值=${scoreValue} (span ${start}-${end})`);
                     await sleep(3500); // 关闭按钮后 1500ms + 此处 3500ms = 两次标注间共 5000ms
                     return true;
                 }
@@ -1098,7 +1329,7 @@
             return false;
         }
 
-        async function applyAllAnnotations(data, subQId) {
+        async function applyAllAnnotations(data, subQId, nerText) {
             const results = data.results || [];
             showResult(data, subQId);
 
@@ -1114,14 +1345,17 @@
 
             let annotated = 0;
             const failedAnnotations = [];
+            const retryNeededIndices = [];
             for (let i = 0; i < results.length; i++) {
                 const r = results[i];
                 const shouldAnnotate = r.satisfied && r.matched_text;
                 dbg('applyAll', `[${i + 1}] shouldAnnotate=${shouldAnnotate}` +
                     (shouldAnnotate ? '' : `（satisfied=${r.satisfied}, matched_text=${!!r.matched_text}）`));
                 if (shouldAnnotate) {
-                    const ok = await annotateOneCriterion(r, i);
-                    if (ok) {
+                    const ok = await annotateOneCriterion(r, i, nerText);
+                    if (ok === 'NEEDS_RETRY') {
+                        retryNeededIndices.push(i);
+                    } else if (ok) {
                         annotated++;
                     } else {
                         failedAnnotations.push({
@@ -1163,8 +1397,9 @@
             }
 
             const failMsg = failedAnnotations.length > 0 ? `，失败 ${failedAnnotations.length} 条` : '';
-            log(`完成！标注 ${annotated}/${results.length} 条${failMsg}，总分: ${data.score_string || '0'}`);
-            return { annotated, total: results.length, failed: failedAnnotations };
+            const retryMsg = retryNeededIndices.length > 0 ? `，待重试 ${retryNeededIndices.length} 条` : '';
+            log(`完成！标注 ${annotated}/${results.length} 条${failMsg}${retryMsg}，总分: ${data.score_string || '0'}`);
+            return { annotated, total: results.length, failed: failedAnnotations, retryNeeded: retryNeededIndices };
         }
 
         // ==========================================
@@ -1309,6 +1544,79 @@
         }
 
         // ==========================================
+        // 10.5 标注执行核心（processSubQuestion 和 sendPendingTask 共用）
+        // ==========================================
+
+        async function executeAnnotationFlow({ apiTaskId, marking, nerText, subQId, taskId, processKey }) {
+            showPending(subQId);
+            await callPhysicsAPI(apiTaskId, marking, nerText);
+            log('评分请求已提交，轮询中...');
+
+            const result = await pollPhysicsResult(apiTaskId);
+            log(`收到结果，总分: ${result.total_score}`);
+
+            lastProcessedKey = processKey;
+            const annotationResult = await applyAllAnnotations(result, subQId, nerText);
+
+            // ── API 重试：对预检失败的条目重新请求评分 ──
+            if (annotationResult.retryNeeded.length > 0) {
+                log(`⚠ ${annotationResult.retryNeeded.length} 条 matched_text 与原文不符，重新请求 API...`);
+                const retryTaskId = apiTaskId + '_r1';
+                try {
+                    await callPhysicsAPI(retryTaskId, marking, nerText);
+                    const retryData = await pollPhysicsResult(retryTaskId);
+                    log(`重试结果收到，总分: ${retryData.total_score}`);
+                    const retryResults = retryData.results || [];
+                    for (const idx of annotationResult.retryNeeded) {
+                        const rr = retryResults[idx];
+                        if (!rr) continue;
+                        log(`重试 [${idx + 1}] matched_text: "${(rr.matched_text || '').substring(0, 50)}"`);
+                        const ok = await annotateOneCriterion(rr, idx, nerText);
+                        if (ok === true) {
+                            annotationResult.annotated++;
+                        } else {
+                            annotationResult.failed.push({
+                                criterionIndex: idx,
+                                criterion: rr.criterion,
+                                matchedText: rr.matched_text
+                            });
+                            log(`✗ [${idx + 1}] 重试后仍无法匹配，放弃`);
+                        }
+                    }
+                } catch (retryErr) {
+                    log(`⚠ API 重试请求失败: ${retryErr.message}`);
+                    for (const idx of annotationResult.retryNeeded) {
+                        annotationResult.failed.push({ criterionIndex: idx, criterion: '', matchedText: '' });
+                    }
+                }
+            }
+
+            // 返修模式：若有标注失败的条目，写入跨标签页共享的返修队列
+            if (getRevisionMode() && annotationResult.failed.length > 0) {
+                const queueItem = {
+                    processKey, taskId, subQId,
+                    failedCriteria: annotationResult.failed,
+                    timestamp: new Date().toISOString()
+                };
+                const _rq = getRevisionQueue();
+                const existingIdx = _rq.findIndex(q => q.processKey === processKey);
+                if (existingIdx >= 0) _rq[existingIdx] = queueItem;
+                else _rq.push(queueItem);
+                setRevisionQueue(_rq);
+                log(`⚠ 返修模式: ${annotationResult.failed.length} 条标注失败 → 已加入返修队列 (共${_rq.length}项)`);
+                updateStatus('返修队列更新');
+            }
+
+            // 自动推进：返修模式下由人工操作，否则末题点提交/点下一题（含重试）
+            if (!getRevisionMode()) {
+                await sleep(1500);
+                await autoAdvance(taskId, subQId);
+            } else {
+                log('⚠ 返修模式：已完成标注，请人工点击下一题或提交');
+            }
+        }
+
+        // ==========================================
         // 11. 主处理流程
         // ==========================================
 
@@ -1321,6 +1629,7 @@
 
             const processKey = `${taskId}__${subQId}`;
             if (processKey === lastProcessedKey) return;
+            if (processKey === pendingExtractKey) return; // 已提取等待手动发送，不重复提取
 
             // 防碰撞：检查其他标签页是否已在处理同一子题
             const collider = checkPhysCollision(processKey);
@@ -1351,41 +1660,17 @@
                 log(`NER文本: ${nerText.length} 字符`);
 
                 const apiTaskId = taskId + '_' + subQId.replace(/[\s\/]/g, '_');
-                showPending(subQId);
 
-                await callPhysicsAPI(apiTaskId, marking, nerText);
-                log('评分请求已提交，轮询中...');
-
-                const result = await pollPhysicsResult(apiTaskId);
-                log(`收到结果，总分: ${result.total_score}`);
-
-                lastProcessedKey = processKey; // 标记为已处理
-                const annotationResult = await applyAllAnnotations(result, subQId);
-
-                // 返修模式：若有标注失败的条目，写入跨标签页共享的返修队列
-                if (getRevisionMode() && annotationResult.failed.length > 0) {
-                    const queueItem = {
-                        processKey,
-                        taskId,
-                        subQId,
-                        failedCriteria: annotationResult.failed,
-                        timestamp: new Date().toISOString()
-                    };
-                    const _rq = getRevisionQueue();
-                    const existingIdx = _rq.findIndex(q => q.processKey === processKey);
-                    if (existingIdx >= 0) {
-                        _rq[existingIdx] = queueItem;
-                    } else {
-                        _rq.push(queueItem);
-                    }
-                    setRevisionQueue(_rq);
-                    log(`⚠ 返修模式: ${annotationResult.failed.length} 条标注失败 → 已加入返修队列 (共${_rq.length}项)`);
-                    updateStatus('返修队列更新');
+                if (getManualSendMode()) {
+                    // 手动发送模式：提取完成后暂停，等待用户点击"发送"按钮
+                    pendingTask       = { apiTaskId, marking, nerText, subQId, taskId, processKey };
+                    pendingExtractKey = processKey;
+                    log(`⏸ 手动发送：已提取 ${subQId}，请点击"发送"按钮`);
+                    updateStatus(`待发送: ${subQId}`);
+                    return; // finally 会执行 releasePhysTask + isProcessing=false
                 }
 
-                // 自动推进：末题点提交，否则点下一题（含重试）
-                await sleep(1500);
-                await autoAdvance(taskId, subQId);
+                await executeAnnotationFlow({ apiTaskId, marking, nerText, subQId, taskId, processKey });
 
             } catch (e) {
                 log('处理出错: ' + e.message);
@@ -1470,7 +1755,7 @@
         try {
             (typeof unsafeWindow !== 'undefined' ? unsafeWindow : window)
                 .addEventListener('storage', (e) => {
-                    if (e.key === PHYS_REVISION_MODE_KEY || e.key === PHYS_REVISION_QUEUE_KEY) {
+                    if (e.key === PHYS_REVISION_MODE_KEY || e.key === PHYS_REVISION_QUEUE_KEY || e.key === PHYS_MANUAL_SEND_KEY) {
                         updateStatus('跨标签页同步');
                     }
                 });

@@ -8,12 +8,17 @@ import uuid
 import json
 import re as _re
 import threading
+import sys
 from collections import deque
 from dotenv import load_dotenv
 import os
 from rate_limiter import instance_limiter
 
 load_dotenv()
+
+# 调试开关：python webui.py -debug 时开启
+# 开启后输出模型响应全文、repr、chunk 等详细内容；默认只保留标识性行
+PHYSICS_DEBUG = "-debug" in sys.argv
 
 MAX_INSTANCES = min(int(os.getenv("MAX_INSTANCES", "8")), 8)
 if MAX_INSTANCES < 1:
@@ -350,7 +355,7 @@ async def receive_physics_task(data: PhysicsTaskData):
                 '      "criterion": "<full criterion text>",\n'
                 '      "points_awarded": <number, 0 if not satisfied>,\n'
                 '      "satisfied": <true or false>,\n'
-                '      "matched_text": "<exact substring from student answer, or null>"\n'
+                '      "matched_text": "<VERBATIM character-for-character copy from student answer, or null>"\n'
                 "    }\n"
                 "  ],\n"
                 '  "total_score": <sum of points_awarded>,\n'
@@ -358,13 +363,49 @@ async def receive_physics_task(data: PhysicsTaskData):
                 '  "note": "<≤20 Chinese characters, or null>"\n'
                 "}\n\n"
                 "IMPORTANT: In score_string, each position must be filled with a number (0 if not awarded, never leave blank).\n"
-                "For the note field: set it ONLY when the student solved the problem using a fundamentally different method or approach than what the marking criteria describe (e.g. used energy method instead of Newton's laws). Set to null in all other cases — including partial credit, wrong answers, or minor phrasing differences.\n"
-                "CRITICAL for matched_text:\n"
-                "  - You MUST copy a substring that appears CHARACTER-FOR-CHARACTER in the student answer.\n"
-                "  - NEVER abbreviate, NEVER use '...', NEVER paraphrase, NEVER omit any characters.\n"
-                "  - If the evidence spans a formula (e.g. $$...$$), copy the ENTIRE formula from its opening $$ to its closing $$.\n"
-                "  - Ideal length is 15–60 characters — enough to be uniquely identifiable but no longer.\n"
-                "  - Use null when the criterion is not satisfied."
+                "For the note field: set it ONLY when the student solved the problem using a fundamentally different method or approach than what the marking criteria describe (e.g. used energy method instead of Newton's laws). Set to null in all other cases — including partial credit, wrong answers, or minor phrasing differences.\n\n"
+                "══════════════════════════════════════════════\n"
+                "STRICT RULES FOR matched_text — FOLLOW EXACTLY\n"
+                "══════════════════════════════════════════════\n"
+                "matched_text is used for EXACT CHARACTER-BY-CHARACTER string search in the student answer.\n"
+                "Even one wrong character means total failure. Treat it like a copy-paste operation.\n\n"
+                "RULE 1 — VERBATIM COPY ONLY:\n"
+                "  Locate the evidence in the student answer. Copy it EXACTLY — every backslash, brace, caret, space, and symbol.\n"
+                "  Do NOT reorder, rename, simplify, or reconstruct anything.\n\n"
+                "RULE 2 — MATHEMATICAL EQUIVALENCE AND JUMP-CONCATENATION ARE FORBIDDEN:\n"
+                "  Even if your version is mathematically equivalent, it is WRONG if it differs from what the student wrote.\n"
+                "  Also forbidden: combining the start and end of a formula while skipping the middle.\n\n"
+                "  BAD EXAMPLE A (rewrite) — student wrote: `v_{c,m}^2 \\approx 4\\pi G C_m \\left(1 - \\frac{r_m}{r}...\\right)`\n"
+                "               you output:   `v_{c,m}(r) \\to \\sqrt{4\\pi G C_m}`   ← INVENTED, NOT IN TEXT, FORBIDDEN\n"
+                "  GOOD EXAMPLE A — copy a verbatim prefix/suffix: `v_{c,m}^2 \\approx 4\\pi G C_m`\n\n"
+                "  BAD EXAMPLE B (jump-concatenation) — student wrote: `P_i = \\frac{0.2}{...} = ... = 481{,}030\\,\\text{Pa}`\n"
+                "               you output:   `P_i = 481{,}030\\,\\text{Pa}`   ← start + end GLUED TOGETHER, NOT CONTIGUOUS, FORBIDDEN\n"
+                "  GOOD EXAMPLE B — copy only the final result: `481{,}030 \\, \\text{Pa} \\approx 4.81 \\times 10^5 \\, \\text{Pa}`\n"
+                "               OR copy the entire $$ block verbatim.\n\n"
+                "RULE 3 — COPY ENTIRE FORMULAS:\n"
+                "  If the evidence is inside a $$ ... $$ block, copy the ENTIRE block verbatim from opening $$ to closing $$.\n"
+                "  Do not stop in the middle of a formula.\n\n"
+                "RULE 4 — NULL IS BETTER THAN WRONG:\n"
+                "  If you cannot find the exact text in the student answer, set matched_text to null.\n"
+                "  A null is recoverable. An invented string causes a permanent mislabeling.\n\n"
+                "RULE 5 — LENGTH:\n"
+                "  Aim for 15–80 characters. Long enough to be uniquely locatable, no longer than necessary.\n\n"
+                "RULE 6 — DO NOT SET matched_text TO null UNLESS ABSOLUTELY NECESSARY:\n"
+                "  A null matched_text means no annotation is placed for that criterion, causing the annotated\n"
+                "  score to fall short of the total score. This is almost always wrong.\n"
+                "  If two criteria are both satisfied by the same piece of text, return that same text for BOTH —\n"
+                "  duplicate matched_text values across criteria are acceptable.\n"
+                "  Only use null when the criterion is genuinely not satisfied (satisfied=false) or when no\n"
+                "  verbatim evidence exists anywhere in the student answer.\n\n"
+                "RULE 7 — CREDIT REQUIRES EXPLICIT EVIDENCE, NOT INFERRED EQUIVALENCE:\n"
+                "  Award credit only if the required result is explicitly present in the student answer.\n"
+                "  ACCEPTABLE: trivial rearrangement (F=ma ↔ a=F/m), different but equivalent notation.\n"
+                "  NOT ACCEPTABLE: multi-step physical reasoning to bridge what the student wrote to what\n"
+                "  EXAMPLE — criterion: 'gives g(r) = G M_int(r)/r² via Gauss's theorem or equivalent'\n"
+                "    Student writes: v_c(r) = sqrt(G M_b / r)  ← Keplerian law, no Gauss theorem shown\n"
+                "    WRONG: 'v_c²/r = G M_b/r² is equivalent to g(r), so satisfied = true'\n"
+                "    RIGHT: g(r) = G M_int(r)/r² is not explicitly present → satisfied = false\n"
+                "  The formula the criterion asks for must appear in the student's own text."
             )
 
             user_content = (
@@ -379,9 +420,10 @@ async def receive_physics_task(data: PhysicsTaskData):
 
             import time as _time
             model_name = os.getenv("MODEL_FLASH", "gemini-3-flash-preview")
-            print(f"[Physics][DBG] base_url={phys_client.base_url}  model={model_name}", flush=True)
-            print(f"[Physics][DBG] system_prompt={len(system_prompt)}字  user_content={len(user_content)}字", flush=True)
-            print(f"[Physics] 调用模型（非流式，心跳每2s输出一次）...", flush=True)
+            if PHYSICS_DEBUG:
+                print(f"[Physics][DBG] base_url={phys_client.base_url}  model={model_name}", flush=True)
+                print(f"[Physics][DBG] system_prompt={len(system_prompt)}字  user_content={len(user_content)}字", flush=True)
+            print(f"[Physics] 调用模型 ({model_name})...", flush=True)
 
             # 无限重试，每次超时限制 120 秒
             _TIMEOUT_SEC = 120
@@ -401,34 +443,39 @@ async def receive_physics_task(data: PhysicsTaskData):
                             {"role": "system", "content": system_prompt},
                             {"role": "user", "content": user_content}
                         ],
-                        temperature=0.1,
+                        temperature=1,
                         stream=True,
                         timeout=_TIMEOUT_SEC
                     ) as stream:
                         for chunk in stream:
                             if first_chunk:
-                                print(f"[Physics][DBG] 首个chunk，耗时={_time.time()-t_start:.1f}s", flush=True)
+                                if PHYSICS_DEBUG:
+                                    print(f"[Physics][DBG] 首个chunk，耗时={_time.time()-t_start:.1f}s", flush=True)
                                 first_chunk = False
                             delta = chunk.choices[0].delta.content if chunk.choices else None
                             if delta:
-                                print(delta, end="", flush=True)
+                                if PHYSICS_DEBUG:
+                                    print(delta, end="", flush=True)
                                 content_parts.append(delta)
 
                     elapsed = _time.time() - t_start
-                    print(f"\n[Physics][DBG] 流结束（第{_attempt}次），耗时={elapsed:.1f}s，共{sum(len(p) for p in content_parts)}字", flush=True)
+                    total_chars = sum(len(p) for p in content_parts)
+                    print(f"\n[Physics] 流结束，耗时={elapsed:.1f}s，{total_chars}字", flush=True)
                     content = "".join(content_parts)
                     break  # 成功，退出重试循环
                 except Exception as api_err:
-                    print(f"\n[Physics][DBG] 第{_attempt}次调用失败: {type(api_err).__name__}: {api_err}", flush=True)
-                    print(f"[Physics] 3秒后重试（第{_attempt + 1}次）...", flush=True)
+                    if PHYSICS_DEBUG:
+                        print(f"\n[Physics][DBG] 第{_attempt}次调用失败: {type(api_err).__name__}: {api_err}", flush=True)
+                    print(f"[Physics] 调用失败，3秒后重试（第{_attempt + 1}次）...", flush=True)
                     _time.sleep(3)
 
             content = content or ""
             content = content.strip()
-            print(f"[Physics][DBG] 原始响应长度={len(content)}字", flush=True)
-            print(f"[Physics] 响应内容：\n{'─'*60}\n{content}\n{'─'*60}", flush=True)
-            # 用 repr 打出原始字节，避免终端渲染 \r\n 等控制字符造成误判
-            print(f"[Physics][DBG] 原始内容 repr（前300字）: {repr(content[:300])}", flush=True)
+            print(f"[Physics] 原始响应长度={len(content)}字", flush=True)
+            if PHYSICS_DEBUG:
+                print(f"[Physics][DBG] 响应内容：\n{'─'*60}\n{content}\n{'─'*60}", flush=True)
+                # 用 repr 打出原始字节，避免终端渲染 \r\n 等控制字符造成误判
+                print(f"[Physics][DBG] 原始内容 repr（前300字）: {repr(content[:300])}", flush=True)
 
             # 移除可能的 markdown 代码块
             content = _re.sub(r'^```(?:json)?\s*', '', content, flags=_re.MULTILINE)
@@ -440,17 +487,38 @@ async def receive_physics_task(data: PhysicsTaskData):
             # (?<!\\) 负向前瞻：跳过已被转义的反斜杠（即 \\ 的第二个 \），避免把合法的 \\pi 破坏成 \\\pi
             content_before = content
             content = _re.sub(r'(?<!\\)\\(?!["\\/bfnrtu])', r'\\\\', content)
-            if content != content_before:
+            if PHYSICS_DEBUG and content != content_before:
                 print(f"[Physics][DBG] regex 修正了转义序列，处理后 repr（前300字）: {repr(content[:300])}", flush=True)
 
             try:
                 result = json.loads(content)
             except json.JSONDecodeError as jde:
-                ctx_s = max(0, jde.pos - 60)
-                ctx_e = min(len(content), jde.pos + 60)
-                print(f"[Physics][DBG] json.loads 失败: {jde}", flush=True)
-                print(f"[Physics][DBG] 出错位置 pos={jde.pos} 前后内容 repr: {repr(content[ctx_s:ctx_e])}", flush=True)
+                print(f"[Physics] json.loads 失败: {jde}", flush=True)
+                if PHYSICS_DEBUG:
+                    ctx_s = max(0, jde.pos - 60)
+                    ctx_e = min(len(content), jde.pos + 60)
+                    print(f"[Physics][DBG] 出错位置 pos={jde.pos} 前后内容 repr: {repr(content[ctx_s:ctx_e])}", flush=True)
                 raise
+
+            # Post-fix: LLM often omits the double-backslash in LaTeX commands,
+            # e.g. outputs \frac instead of \\frac inside JSON strings.
+            # json.loads() silently converts \f → form-feed (U+000C),
+            # \b → backspace (U+0008), \r → CR (U+000D), \t → tab (U+0009).
+            # These control characters are meaningless in LaTeX math text —
+            # restore them to their literal backslash+letter form.
+            def _restore_latex_escapes(obj):
+                if isinstance(obj, dict):
+                    return {k: _restore_latex_escapes(v) for k, v in obj.items()}
+                if isinstance(obj, list):
+                    return [_restore_latex_escapes(v) for v in obj]
+                if isinstance(obj, str):
+                    return (obj
+                            .replace('\f', '\\f')   # \frac \forall \footnote ...
+                            .replace('\b', '\\b')   # \begin \beta \bf ...
+                            .replace('\r', '\\r')   # \rho \right \rm ...
+                            .replace('\t', '\\t'))  # \theta \tau \text \times ...
+                return obj
+            result = _restore_latex_escapes(result)
 
             # 确保 score_string 的每个位置都有数字（0而非空）
             if "results" in result:
@@ -533,4 +601,10 @@ async def clear_revision_queue():
 
 
 if __name__ == "__main__":
+    if PHYSICS_DEBUG:
+        print("[WebUI] *** DEBUG 模式已开启 ***", flush=True)
+    else:
+        print("[WebUI] 正常模式（加 -debug 参数可开启详细日志）", flush=True)
+    # 将 -debug 从 sys.argv 中移除，避免 uvicorn 误解析该参数
+    sys.argv = [a for a in sys.argv if a != "-debug"]
     uvicorn.run(app, host="0.0.0.0", port=8001, access_log=False)
