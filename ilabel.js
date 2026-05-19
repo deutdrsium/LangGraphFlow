@@ -102,6 +102,7 @@
     // ==========================================
     let resultPollingTimer = null;
     let resultDisplayed = false;
+    let isResultWindowCollapsed = false;
 
     function getTaskUUIDElement() {
         const uuidRegex = /^[a-f0-9]{32}$/i;
@@ -174,20 +175,64 @@
         return resultDiv;
     }
 
+    unsafeWindow.toggleLangGraphResultWindow = function() {
+        isResultWindowCollapsed = !isResultWindowCollapsed;
+        let resultDiv = document.getElementById("langgraph-result-window");
+        if (!resultDiv) return;
+
+        let content = resultDiv.dataset.content || "";
+        let taskId = resultDiv.dataset.taskId || "";
+        renderResultWindow(resultDiv, taskId, content);
+    };
+
+    function applyResultWindowLayout(resultDiv) {
+        if (isResultWindowCollapsed) {
+            resultDiv.style.padding = "10px 12px";
+            resultDiv.style.minWidth = "0";
+            resultDiv.style.maxWidth = "none";
+            resultDiv.style.width = "auto";
+        } else {
+            resultDiv.style.padding = "15px";
+            resultDiv.style.minWidth = "300px";
+            resultDiv.style.maxWidth = "400px";
+            resultDiv.style.width = "auto";
+        }
+    }
+
+    function createResultWindowHeader(taskId) {
+        let collapseText = isResultWindowCollapsed ? "展开" : "折叠";
+        let cancelButton = taskId ? `<button id="cancel-task-btn-${taskId}" onclick="window.cancelLangGraphTask('${taskId}')" style="cursor:pointer; background:#f5222d; color:white; border:none; padding:2px 8px; border-radius:4px; font-size:11px;">清空后台任务</button>` : "";
+
+        return `<div style="display:flex; justify-content:space-between; align-items:center; gap:10px; margin-bottom:${isResultWindowCollapsed ? '0' : '8px'};">
+            <strong style="color:white; font-size:14px; white-space:nowrap;">🤖 LangGraph 推理结果</strong>
+            <div style="display:flex; align-items:center; gap:6px;">
+                <button onclick="window.toggleLangGraphResultWindow()" style="cursor:pointer; background:#1677ff; color:white; border:none; padding:2px 8px; border-radius:4px; font-size:11px;">${collapseText}</button>
+                ${isResultWindowCollapsed ? "" : cancelButton}
+            </div>
+        </div>`;
+    }
+
+    function renderResultWindow(resultDiv, taskId, bodyContent) {
+        applyResultWindowLayout(resultDiv);
+        resultDiv.dataset.taskId = taskId;
+        resultDiv.dataset.content = bodyContent;
+
+        let content = createResultWindowHeader(taskId);
+        if (!isResultWindowCollapsed) {
+            content += `<hr style="border-color:#444; margin:5px 0;">`;
+            content += bodyContent;
+        }
+        resultDiv.innerHTML = content;
+    }
+
     function displayPendingState(taskId) {
         let taskInfo = getTaskUUIDElement();
         if (!taskInfo || taskInfo.text !== taskId) return;
 
         let resultDiv = createBaseResultWindow(taskId);
         
-        let content = `<div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:8px;">
-            <strong style="color:white; font-size:14px;">🤖 LangGraph 推理结果</strong>
-            <button id="cancel-task-btn-${taskId}" onclick="window.cancelLangGraphTask('${taskId}')" style="cursor:pointer; background:#f5222d; color:white; border:none; padding:2px 8px; border-radius:4px; font-size:11px;">清空后台任务</button>
-        </div><hr style="border-color:#444; margin:5px 0;">`;
-        
-        content += `<span style="color:yellow">⏳ 正在等待 LangGraph 后台计算，请稍候...</span><br>`;
-        resultDiv.innerHTML = content;
-        resultDiv.dataset.taskId = taskId;
+        let content = `<span style="color:yellow">⏳ 正在等待 LangGraph 后台计算，请稍候...</span><br>`;
+        renderResultWindow(resultDiv, taskId, content);
     }
 
     function displayResult(data, taskId) {
@@ -196,12 +241,7 @@
         
         let resultDiv = createBaseResultWindow(taskId);
         
-        let content = `<div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:8px;">
-            <strong style="color:white; font-size:14px;">🤖 LangGraph 推理结果</strong>
-            <button id="cancel-task-btn-${taskId}" onclick="window.cancelLangGraphTask('${taskId}')" style="cursor:pointer; background:#f5222d; color:white; border:none; padding:2px 8px; border-radius:4px; font-size:11px;">清空后台任务</button>
-        </div><hr style="border-color:#444; margin:5px 0;">`;
-        
-        content += `<span style="color:#00BFFF">层级:</span> <span style="color:#FFF">${data.hierarchy || '无'}</span> &nbsp;|&nbsp; <span style="color:#00BFFF">难度:</span> <span style="color:#FFF">${data.difficulty || '无'}</span><br>`;
+        let content = `<span style="color:#00BFFF">层级:</span> <span style="color:#FFF">${data.hierarchy || '无'}</span> &nbsp;|&nbsp; <span style="color:#00BFFF">难度:</span> <span style="color:#FFF">${data.difficulty || '无'}</span><br>`;
         content += `<span style="color:#00BFFF">类型:</span> <span style="color:#FFF">${data.problem_type || '无'}</span><br>`;
         
         if (data.trap_analysis) {
@@ -231,8 +271,7 @@
              }
         }
         
-        resultDiv.innerHTML = content;
-        resultDiv.dataset.taskId = taskId;
+        renderResultWindow(resultDiv, taskId, content);
     }
 
     // ==========================================
