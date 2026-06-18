@@ -19,6 +19,267 @@ client = OpenAI()
 # 全局存储流式输出用于前端展示
 streaming_store = {}
 
+BUILTIN_HELPER_MODULES = {"wolfram_eval"}
+PYTHON_FENCE_LANGS = {"python", "py", "python3", "python2", "ipython"}
+GENERIC_FENCE_LANGS = {"", "code", "text", "txt"}
+
+
+def reasoning_effort_kwargs(model_tier: str) -> dict:
+    effort = os.getenv(f"MODEL_{model_tier}_REASONING_EFFORT", "").strip().lower()
+    if not effort or effort in {"none", "off", "false", "0"}:
+        return {}
+    return {"reasoning_effort": effort}
+
+
+def code_extraction_max_retries() -> int:
+    try:
+        retries = int(os.getenv("CODE_EXTRACTION_MAX_RETRIES", "1"))
+    except ValueError:
+        retries = 1
+    return max(0, min(retries, 3))
+
+
+def code_retry_user_prompt(question: str, previous_output: str) -> str:
+    previous_output = (previous_output or "").strip()
+    if len(previous_output) > 6000:
+        previous_output = previous_output[-6000:]
+    return (
+        "The previous model response did not contain any executable Python code. "
+        "This is a recoverable generation failure.\n\n"
+        "Return exactly one of the following:\n"
+        "1. If the problem is invalid or impossible, output [TRAP_DETECTED] followed by a short reason.\n"
+        "2. Otherwise, output ONLY executable Python code inside a ```python fenced block. "
+        "The code must print the final answer to STDOUT. Do not include analysis, reasoning, markdown prose, "
+        "or any text outside the code fence.\n\n"
+        f"[Original Question]\n{question}\n\n"
+        f"[Previous Non-Executable Response]\n{previous_output}"
+    )
+
+
+def _clean_code_candidate(code: str) -> str:
+    code = (code or "").replace("\r\n", "\n").replace("\r", "\n").strip()
+    code = re.sub(r"^\s*(?:python|py|python3)\s*\n", "", code, flags=re.IGNORECASE)
+    return code.strip()
+
+
+def _compile_score(code: str) -> int:
+    if not code.strip():
+        return -100
+    try:
+        compile(code, "<generated_code>", "exec")
+        return 50
+    except SyntaxError:
+        return -20
+
+
+def _is_compilable_python(code: str) -> bool:
+    if not code.strip():
+        return False
+    try:
+        compile(code, "<generated_code>", "exec")
+        return True
+    except SyntaxError:
+        return False
+
+
+CODE_LINE_RE = re.compile(
+    r"^\s*(?:"
+    r"#|import |from |def |class |for |while |if |elif |else:|try:|except |finally:|"
+    r"with |return\b|raise\b|assert\b|print\s*\(|"
+    r"[\w.]+\s*=|[\w.]+\s*\(|[\]\)\}]"
+    r")"
+)
+
+
+def _has_python_execution_signal(code: str) -> bool:
+    stripped = code.strip()
+    if not stripped:
+        return False
+    signal_patterns = [
+        r"^\s*(?:import|from)\s+\w+",
+        r"^\s*(?:def|class|for|while|if|try|with)\b",
+        r"\bprint\s*\(",
+        r"\bwolfram_eval\s*\(",
+        r"\bsys\.stdout\.write\s*\(",
+        r"^\s*\w[\w.]*\s*=",
+    ]
+    return any(re.search(pattern, stripped, re.MULTILINE) for pattern in signal_patterns)
+
+
+def _trim_to_compilable_python(code: str) -> str:
+    cleaned = _clean_code_candidate(code)
+    if _is_compilable_python(cleaned) and _has_python_execution_signal(cleaned):
+        return cleaned
+
+    lines = cleaned.splitlines()
+    code_indices = [i for i, line in enumerate(lines) if CODE_LINE_RE.match(line)]
+    if not code_indices:
+        return ""
+
+    trimmed = "\n".join(lines[code_indices[0] : code_indices[-1] + 1]).strip()
+    if _is_compilable_python(trimmed) and _has_python_execution_signal(trimmed):
+        return trimmed
+
+    # Last-resort salvage: find the largest compilable contiguous code-looking block.
+    best = ""
+    starts = code_indices[:]
+    for start in starts:
+        for end in range(len(lines), start, -1):
+            chunk = "\n".join(lines[start:end]).strip()
+            if len(chunk) <= len(best):
+                continue
+            if _is_compilable_python(chunk) and _has_python_execution_signal(chunk):
+                best = chunk
+                break
+    return best
+
+
+def _python_signal_score(code: str) -> int:
+    stripped = code.strip()
+    if not stripped:
+        return -100
+
+    score = 0
+    strong_patterns = [
+        r"\bimport\s+\w+",
+        r"\bfrom\s+\w+\s+import\b",
+        r"\bdef\s+\w+\s*\(",
+        r"\bclass\s+\w+",
+        r"\bprint\s*\(",
+        r"\bwolfram_eval\s*\(",
+        r"\b(?:sympy|numpy|scipy|math|itertools|fractions|decimal)\b",
+        r"\b(?:sp|np)\.",
+        r"^\s*(?:for|while|if|with|try|except|return|raise|assert)\b",
+        r"^\s*\w[\w.]*\s*=",
+    ]
+    for pattern in strong_patterns:
+        if re.search(pattern, stripped, re.MULTILINE):
+            score += 8
+
+    prose_markers = [
+        "```",
+        "Here is",
+        "The code",
+        "I will",
+        "We need",
+        "Let's",
+        "下面",
+        "代码如下",
+    ]
+    for marker in prose_markers:
+        if marker in stripped:
+            score -= 8
+
+    code_like_lines = 0
+    prose_like_lines = 0
+    for line in stripped.splitlines():
+        s = line.strip()
+        if not s:
+            continue
+        if re.match(
+            r"^(?:#|import |from |def |class |for |while |if |elif |else:|try:|except |finally:|with |return |raise |assert |print\(|[\w.]+\s*=)",
+            s,
+        ):
+            code_like_lines += 1
+        elif len(s.split()) >= 8 and not any(token in s for token in ("=", "(", ")", "[", "]", "{", "}")):
+            prose_like_lines += 1
+
+    score += code_like_lines * 3
+    score -= prose_like_lines * 5
+    score += _compile_score(stripped)
+    return score
+
+
+def _fenced_code_candidates(text: str):
+    normalized = (text or "").replace("\r\n", "\n").replace("\r", "\n")
+    pattern = re.compile(
+        r"(?P<fence>`{3,}|~{3,})[ \t]*(?P<lang>[^\n`]*)\n(?P<code>.*?)(?:\n(?P=fence)[ \t]*(?=\n|$)|$)",
+        re.DOTALL,
+    )
+    for index, match in enumerate(pattern.finditer(normalized)):
+        lang = (match.group("lang") or "").strip().lower().split()
+        lang = lang[0] if lang else ""
+        code = _clean_code_candidate(match.group("code"))
+        if not code:
+            continue
+        code = _trim_to_compilable_python(code)
+        if not code:
+            continue
+        if lang in PYTHON_FENCE_LANGS:
+            priority = 100
+        elif lang in GENERIC_FENCE_LANGS:
+            priority = 35
+        else:
+            priority = -15
+        yield priority + _python_signal_score(code), index, code
+
+
+def _tagged_code_candidates(text: str):
+    normalized = (text or "").replace("\r\n", "\n").replace("\r", "\n")
+    pattern = re.compile(
+        r"<(?P<tag>python|py|code)>(?P<code>.*?)</(?P=tag)>",
+        re.IGNORECASE | re.DOTALL,
+    )
+    for index, match in enumerate(pattern.finditer(normalized)):
+        code = _trim_to_compilable_python(match.group("code"))
+        if code:
+            yield 70 + _python_signal_score(code), index, code
+
+
+def _line_block_candidates(text: str):
+    normalized = (text or "").replace("\r\n", "\n").replace("\r", "\n")
+    lines = normalized.splitlines()
+    code_line = re.compile(
+        r"^\s*(?:#|import |from |def |class |for |while |if |elif |else:|try:|except |finally:|with |return |raise |assert |print\(|[\w.]+\s*=|[\w.]+\s*\(|\])"
+    )
+
+    blocks = []
+    current = []
+    start = 0
+    for index, line in enumerate(lines):
+        stripped = line.strip()
+        if not stripped and current:
+            current.append(line)
+            continue
+        if code_line.match(line):
+            if not current:
+                start = index
+            current.append(line)
+            continue
+        if current:
+            blocks.append((start, "\n".join(current)))
+            current = []
+    if current:
+        blocks.append((start, "\n".join(current)))
+
+    for index, block in blocks:
+        code = _clean_code_candidate(block)
+        if code and _is_compilable_python(code) and _has_python_execution_signal(code):
+            yield 20 + _python_signal_score(code), index, code
+
+
+def extract_python_code(model_output: str) -> str:
+    """Extract executable Python from an LLM answer with tolerant fallbacks."""
+    text = (model_output or "").replace("\r\n", "\n").replace("\r", "\n").strip()
+    if not text:
+        return ""
+
+    candidates = []
+    candidates.extend(_fenced_code_candidates(text))
+    candidates.extend(_tagged_code_candidates(text))
+    candidates.extend(_line_block_candidates(text))
+
+    raw = _clean_code_candidate(text)
+    if raw and _is_compilable_python(raw) and _has_python_execution_signal(raw):
+        raw_score = _python_signal_score(raw)
+        candidates.append((raw_score, 10_000, raw))
+
+    if not candidates:
+        return ""
+
+    candidates.sort(key=lambda item: (item[0], -item[1]), reverse=True)
+    return candidates[0][2]
+
 # Docker 客户端单例（设置较长超时以应对 Windows Named Pipe 偶发延迟）
 _docker_client = None
 def _get_docker_client():
@@ -78,7 +339,8 @@ def type_classifier_node(state: GraphState):
                     {"role": "user", "content": f"Please classify the following question:\n\n{question}"}
                 ],
                 response_format=ClassificationResult,
-                temperature=1.0
+                temperature=1.0,
+                **reasoning_effort_kwargs("FLASH"),
             )
             result = response.choices[0].message.parsed
             return {
@@ -94,7 +356,8 @@ def type_classifier_node(state: GraphState):
                     {"role": "system", "content": prompt_with_instructions},
                     {"role": "user", "content": f"Please classify the following question:\n\n{question}"}
                 ],
-                temperature=1.0
+                temperature=1.0,
+                **reasoning_effort_kwargs("FLASH"),
             )
             content = response.choices[0].message.content.strip()
             content = content.replace("```json", "").replace("```", "").strip()
@@ -132,21 +395,29 @@ def analyze_and_solve_node(state: GraphState, config: RunnableConfig = None):
 
     attempt = 0
     error_codes = []
+    extraction_attempt = 0
+    max_extraction_retries = code_extraction_max_retries()
 
     while True:
         try:
             if pro_limiter:
                 print("[Rate Limit] Waiting for MODEL_PRO slot...", flush=True)
                 pro_limiter.acquire()
+            user_prompt = (
+                f"请分析并求解以下题目：\n\n{question}"
+                if extraction_attempt == 0
+                else code_retry_user_prompt(question, final_content)
+            )
             response = client.chat.completions.create(
                 model=os.getenv("MODEL_PRO", "gemini-3.1-pro-preview"),
                 messages=[
                     {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": f"请分析并求解以下题目：\n\n{question}"}
+                    {"role": "user", "content": user_prompt}
                 ],
                 temperature=1.0,
                 stream=True,
-                timeout=60.0
+                timeout=60.0,
+                **reasoning_effort_kwargs("PRO"),
             )
 
             display_content = ""  # 用于前端实时展示，包含 CoT 和正文
@@ -190,12 +461,17 @@ def analyze_and_solve_node(state: GraphState, config: RunnableConfig = None):
                     "generated_code": "pass"
                 }
             else:
-                # 正常代码生成，提取 python 代码块
-                match = re.search(r'```python\n(.*?)\n```', final_content, re.DOTALL)
-                if match:
-                    generated_code = match.group(1).strip()
-                else:
-                    generated_code = final_content
+                generated_code = extract_python_code(final_content)
+                if not generated_code.strip():
+                    if extraction_attempt < max_extraction_retries:
+                        extraction_attempt += 1
+                        print(
+                            f"No executable Python code extracted; retrying code generation "
+                            f"({extraction_attempt}/{max_extraction_retries})...",
+                            flush=True,
+                        )
+                        continue
+                    generated_code = "raise RuntimeError('No executable Python code was extracted from the model output after retry.')"
 
                 return {
                     "trap_analysis": False,
@@ -280,6 +556,8 @@ def code_executor_node(state: GraphState):
                     match = re.search(r"No module named '([^']+)'", stderr_logs)
                     if match and attempt < max_retries - 1:
                         missing_module = match.group(1)
+                        if missing_module in BUILTIN_HELPER_MODULES:
+                            break
                         print(f"检测到缺失库: {missing_module}，准备重新构建镜像并安装...")
                         new_image_tag = f"math_sandbox_with_{missing_module}:latest"
                         dockerfile = f"FROM {current_image}\nRUN pip install {missing_module}"
@@ -346,7 +624,8 @@ def judge_node(state: GraphState):
                     {"role": "user", "content": user_content}
                 ],
                 response_format=JudgeResult,
-                temperature=1.0
+                temperature=1.0,
+                **reasoning_effort_kwargs("FLASH"),
             )
             result = response.choices[0].message.parsed
             return {
@@ -362,7 +641,8 @@ def judge_node(state: GraphState):
                     {"role": "system", "content": prompt_with_instructions},
                     {"role": "user", "content": user_content}
                 ],
-                temperature=1.0
+                temperature=1.0,
+                **reasoning_effort_kwargs("FLASH"),
             )
             content = response.choices[0].message.content.strip()
             content = content.replace("```json", "").replace("```", "").strip()
