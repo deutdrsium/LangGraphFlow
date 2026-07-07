@@ -56,6 +56,66 @@ def code_retry_user_prompt(question: str, previous_output: str) -> str:
     )
 
 
+def anthropic_messages_enabled() -> bool:
+    protocol = os.getenv("LLM_API_PROTOCOL", os.getenv("LLM_COMPAT_MODE", "openai")).strip().lower()
+    return protocol in {"anthropic", "anthropic_messages", "anthropic-messages", "anthropic_messages_compat"}
+
+
+def llm_model_name(model_tier: str, default_model: str) -> str:
+    return os.getenv(f"MODEL_{model_tier}", default_model).strip()
+
+
+def anthropic_api_key() -> str:
+    return (
+        os.getenv("ANTHROPIC_API_KEY", "").strip()
+        or os.getenv("OPENAI_API_KEY", "").strip()
+    )
+
+
+def anthropic_auth_header() -> str:
+    key = anthropic_api_key()
+    if key.lower().startswith("bearer "):
+        return key
+    return f"Bearer {key}"
+
+
+def anthropic_custom_headers() -> dict:
+    return {
+        "Authorization": anthropic_auth_header(),
+        "User-Agent": os.getenv("ANTHROPIC_USER_AGENT", "claude-cli/2.0.76 (external, cli)"),
+    }
+
+
+def create_chat_completion(model_tier: str, default_model: str, **kwargs):
+    if not anthropic_messages_enabled():
+        return client.chat.completions.create(
+            model=llm_model_name(model_tier, default_model),
+            **kwargs,
+        )
+
+    try:
+        import litellm
+    except ImportError as e:
+        raise RuntimeError("LLM_API_PROTOCOL=anthropic_messages requires `pip install litellm`.") from e
+
+    base_url = (
+        os.getenv("ANTHROPIC_BASE_URL", "").strip()
+        or os.getenv("ANTHROPIC_API_BASE", "").strip()
+    )
+    kwargs.pop("reasoning_effort", None)
+    call_kwargs = {
+        "model": llm_model_name(model_tier, default_model),
+        "api_key": anthropic_api_key(),
+        "extra_headers": anthropic_custom_headers(),
+        "drop_params": True,
+        **kwargs,
+    }
+    if base_url:
+        call_kwargs["api_base"] = base_url
+        call_kwargs["base_url"] = base_url
+    return litellm.completion(**call_kwargs)
+
+
 def _clean_code_candidate(code: str) -> str:
     code = (code or "").replace("\r\n", "\n").replace("\r", "\n").strip()
     code = re.sub(r"^\s*(?:python|py|python3)\s*\n", "", code, flags=re.IGNORECASE)
@@ -331,9 +391,9 @@ def type_classifier_node(state: GraphState):
         if flash_limiter:
             print("[Rate Limit] Waiting for MODEL_FLASH slot (type_classifier)...", flush=True)
             flash_limiter.acquire()
-        if support_structured:
+        if support_structured and not anthropic_messages_enabled():
             response = client.beta.chat.completions.parse(
-                model=os.getenv("MODEL_FLASH", "gemini-3-flash-preview"),
+                model=llm_model_name("FLASH", "gemini-3-flash-preview"),
                 messages=[
                     {"role": "system", "content": prompt},
                     {"role": "user", "content": f"Please classify the following question:\n\n{question}"}
@@ -350,8 +410,9 @@ def type_classifier_node(state: GraphState):
             }
         else:
             prompt_with_instructions = prompt + "\n\nPlease return ONLY a JSON object string exactly matching this schema: {\"problem_type\": \"几何|代数|概率|数论\", \"hierarchy\": \"初中|高中|本科|硕士及以上\", \"difficulty\": \"基础|进阶|竞赛\"}. Do not use code blocks."
-            response = client.chat.completions.create(
-                model=os.getenv("MODEL_FLASH", "gemini-3-flash-preview"),
+            response = create_chat_completion(
+                "FLASH",
+                "gemini-3-flash-preview",
                 messages=[
                     {"role": "system", "content": prompt_with_instructions},
                     {"role": "user", "content": f"Please classify the following question:\n\n{question}"}
@@ -408,8 +469,9 @@ def analyze_and_solve_node(state: GraphState, config: RunnableConfig = None):
                 if extraction_attempt == 0
                 else code_retry_user_prompt(question, final_content)
             )
-            response = client.chat.completions.create(
-                model=os.getenv("MODEL_PRO", "gemini-3.1-pro-preview"),
+            response = create_chat_completion(
+                "PRO",
+                "gemini-3.1-pro-preview",
                 messages=[
                     {"role": "system", "content": system_prompt},
                     {"role": "user", "content": user_prompt}
@@ -616,9 +678,9 @@ def judge_node(state: GraphState):
         if flash_limiter:
             print("[Rate Limit] Waiting for MODEL_FLASH slot (judge)...", flush=True)
             flash_limiter.acquire()
-        if support_structured:
+        if support_structured and not anthropic_messages_enabled():
             response = client.beta.chat.completions.parse(
-                model=os.getenv("MODEL_FLASH", "gemini-3-flash-preview"),
+                model=llm_model_name("FLASH", "gemini-3-flash-preview"),
                 messages=[
                     {"role": "system", "content": prompt},
                     {"role": "user", "content": user_content}
@@ -635,8 +697,9 @@ def judge_node(state: GraphState):
             }
         else:
             prompt_with_instructions = prompt + "\n\nPlease return ONLY a JSON object string exactly matching this schema: {\"confidence\": <int>, \"decision\": \"Match\" or \"Mismatch\" or \"Error\", \"verified_ans\": <string>}. Use 'pass' for verified_ans if decision is Match. Do not use code blocks."
-            response = client.chat.completions.create(
-                model=os.getenv("MODEL_FLASH", "gemini-3-flash-preview"),
+            response = create_chat_completion(
+                "FLASH",
+                "gemini-3-flash-preview",
                 messages=[
                     {"role": "system", "content": prompt_with_instructions},
                     {"role": "user", "content": user_content}

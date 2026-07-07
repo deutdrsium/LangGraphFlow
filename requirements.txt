@@ -1,0 +1,10 @@
+docker
+fastapi
+langchain-core
+langgraph
+litellm
+openai
+pydantic
+python-dotenv
+requests
+uvicorn

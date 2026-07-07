@@ -23,6 +23,11 @@ def _load_extract_python_code():
         "extract_python_code",
         "code_extraction_max_retries",
         "code_retry_user_prompt",
+        "anthropic_messages_enabled",
+        "llm_model_name",
+        "anthropic_api_key",
+        "anthropic_auth_header",
+        "anthropic_custom_headers",
     }
     selected = [
         ast.Import(names=[ast.alias(name="os")]),
@@ -45,6 +50,10 @@ def _load_extract_python_code():
 extract_python_code = _load_extract_python_code()
 code_extraction_max_retries = extract_python_code.__globals__["code_extraction_max_retries"]
 code_retry_user_prompt = extract_python_code.__globals__["code_retry_user_prompt"]
+anthropic_messages_enabled = extract_python_code.__globals__["anthropic_messages_enabled"]
+llm_model_name = extract_python_code.__globals__["llm_model_name"]
+anthropic_auth_header = extract_python_code.__globals__["anthropic_auth_header"]
+anthropic_custom_headers = extract_python_code.__globals__["anthropic_custom_headers"]
 
 
 class ExtractPythonCodeTests(unittest.TestCase):
@@ -144,6 +153,39 @@ class ExtractPythonCodeTests(unittest.TestCase):
         self.assertIn("[TRAP_DETECTED]", prompt)
         self.assertIn("```python", prompt)
         self.assertIn("Looking at this problem", prompt)
+
+    def test_anthropic_mode_helpers(self):
+        old_values = {
+            key: os.environ.get(key)
+            for key in (
+                "LLM_API_PROTOCOL",
+                "OPENAI_API_KEY",
+                "ANTHROPIC_API_KEY",
+                "ANTHROPIC_USER_AGENT",
+            )
+        }
+        try:
+            os.environ["LLM_API_PROTOCOL"] = "anthropic_messages"
+            os.environ["OPENAI_API_KEY"] = "sk-test"
+            os.environ.pop("ANTHROPIC_API_KEY", None)
+            os.environ["ANTHROPIC_USER_AGENT"] = "claude-cli/2.0.76 (external, cli)"
+
+            self.assertTrue(anthropic_messages_enabled())
+            self.assertEqual(llm_model_name("PRO", "claude-opus-4-7"), "claude-opus-4-7")
+            self.assertEqual(anthropic_auth_header(), "Bearer sk-test")
+            self.assertEqual(
+                anthropic_custom_headers(),
+                {
+                    "Authorization": "Bearer sk-test",
+                    "User-Agent": "claude-cli/2.0.76 (external, cli)",
+                },
+            )
+        finally:
+            for key, value in old_values.items():
+                if value is None:
+                    os.environ.pop(key, None)
+                else:
+                    os.environ[key] = value
 
 
 if __name__ == "__main__":

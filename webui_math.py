@@ -74,11 +74,14 @@ import main
 from main import (
     ClassificationResult,
     GraphState,
+    anthropic_messages_enabled,
     analyze_and_solve_node,
+    create_chat_completion,
     extract_python_code,
     judge_node,
     code_extraction_max_retries,
     code_retry_user_prompt,
+    llm_model_name,
     reasoning_effort_kwargs,
     route_after_analyze,
     route_after_judge,
@@ -124,14 +127,13 @@ class HumanDecision(BaseModel):
 def type_classifier_lite_node(state: GraphState):
     question = state.get("question_context", "")
     prompt = os.getenv("TYPE_CLASSIFIER_PROMPT", "You are an expert math problem classifier...")
-    model_name = os.getenv("MODEL_LITE", "claude-3-5-haiku-latest")
     support_structured = os.getenv("SUPPORT_STRUCTURED_OUTPUT", "True").lower() == "true"
     client = OpenAI()
 
     try:
-        if support_structured:
+        if support_structured and not anthropic_messages_enabled():
             response = client.beta.chat.completions.parse(
-                model=model_name,
+                model=llm_model_name("LITE", "claude-3-5-haiku-latest"),
                 messages=[
                     {"role": "system", "content": prompt},
                     {"role": "user", "content": f"Please classify the following question:\n\n{question}"},
@@ -154,8 +156,9 @@ def type_classifier_lite_node(state: GraphState):
             + '{"problem_type": "几何|代数|概率|数论", "hierarchy": "初中|高中|本科|硕士及以上", '
             + '"difficulty": "基础|进阶|竞赛"}. Do not use code blocks.'
         )
-        response = client.chat.completions.create(
-            model=model_name,
+        response = create_chat_completion(
+            "LITE",
+            "claude-3-5-haiku-latest",
             messages=[
                 {"role": "system", "content": prompt_with_instructions},
                 {"role": "user", "content": f"Please classify the following question:\n\n{question}"},
@@ -174,7 +177,7 @@ def type_classifier_lite_node(state: GraphState):
         }
     except Exception as e:
         if MATH_DEBUG:
-            print(f"Error calling MODEL_LITE classifier ({model_name}): {e}", flush=True)
+            print(f"Error calling MODEL_LITE classifier ({llm_model_name('LITE', 'claude-3-5-haiku-latest')}): {e}", flush=True)
         return {
             "problem_type": "代数",
             "hierarchy": "高中",
@@ -210,8 +213,9 @@ def analyze_and_solve_non_stream_node(state: GraphState, config=None):
                 if extraction_attempt == 0
                 else code_retry_user_prompt(question, final_content)
             )
-            response = client.chat.completions.create(
-                model=os.getenv("MODEL_PRO", "gemini-3.1-pro-preview"),
+            response = create_chat_completion(
+                "PRO",
+                "gemini-3.1-pro-preview",
                 messages=[
                     {"role": "system", "content": system_prompt},
                     {"role": "user", "content": user_prompt},
