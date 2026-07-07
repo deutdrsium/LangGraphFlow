@@ -81,14 +81,18 @@
         []
       );
 
-      const runGraph = async (q = question, t = truth, tid = taskId) => {
+      const runGraph = async (q = question, t = truth, tid = taskId, restartTimestamp = null) => {
         if (!q || !q.trim()) return;
         try {
           setSessionStatus('running');
+          const payload = { question: q, truth: t, task_id: tid };
+          if (restartTimestamp !== null) {
+            payload.cache_bust_timestamp = restartTimestamp;
+          }
           const res = await fetch('/api/run', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ question: q, truth: t, task_id: tid })
+            body: JSON.stringify(payload)
           });
           const data = await res.json();
           if (onThreadIdChange) onThreadIdChange(instanceId, data.thread_id);
@@ -261,7 +265,7 @@
                   setSelectedNode(null);
                   setNodes(INITIAL_NODES.map(n => ({ ...n, style: { backgroundColor: '#ffffff' } })));
                   await wait();
-                  runGraph(savedQ, savedT, savedTid);
+                  runGraph(savedQ, savedT, savedTid, Math.floor(Date.now() / 1000));
                 }}
               >重启</button>
               <button

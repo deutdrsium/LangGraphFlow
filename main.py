@@ -19,6 +19,17 @@ client = OpenAI()
 # 全局存储流式输出用于前端展示
 streaming_store = {}
 
+def env_int(name: str, default: int, minimum: int = 1) -> int:
+    try:
+        value = int(os.getenv(name, str(default)))
+    except ValueError:
+        value = default
+    return max(minimum, value)
+
+
+DOCKER_CLIENT_TIMEOUT = env_int("DOCKER_CLIENT_TIMEOUT", 120)
+SANDBOX_CODE_TIMEOUT = env_int("SANDBOX_CODE_TIMEOUT", 60)
+
 BUILTIN_HELPER_MODULES = {"wolfram_eval"}
 PYTHON_FENCE_LANGS = {"python", "py", "python3", "python2", "ipython"}
 GENERIC_FENCE_LANGS = {"", "code", "text", "txt"}
@@ -345,12 +356,12 @@ _docker_client = None
 def _get_docker_client():
     global _docker_client
     if _docker_client is None:
-        _docker_client = docker.from_env(timeout=120)
+        _docker_client = docker.from_env(timeout=DOCKER_CLIENT_TIMEOUT)
     else:
         try:
             _docker_client.ping()
         except Exception:
-            _docker_client = docker.from_env(timeout=120)
+            _docker_client = docker.from_env(timeout=DOCKER_CLIENT_TIMEOUT)
     return _docker_client
 
 
@@ -595,8 +606,8 @@ def code_executor_node(state: GraphState):
             )
             
             try:
-                # 阻塞等待最多 60 秒
-                result = container.wait(timeout=60)
+                # 阻塞等待最多 SANDBOX_CODE_TIMEOUT 秒
+                result = container.wait(timeout=SANDBOX_CODE_TIMEOUT)
                 
                 # 分离获取 stdout 和 stderr
                 stdout_logs = container.logs(stdout=True, stderr=False).decode("utf-8")
@@ -636,7 +647,7 @@ def code_executor_node(state: GraphState):
             except requests.exceptions.ReadTimeout:
                 # 如果超时，则强制销毁进程并记录报错信息
                 container.kill()
-                execution_output = "Error: Code execution exceeded the 60 seconds timeout."
+                execution_output = f"Error: Code execution exceeded the {SANDBOX_CODE_TIMEOUT} seconds timeout."
                 break
                 
             finally:

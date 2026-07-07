@@ -48,6 +48,16 @@ MODEL_LITE_TIMEOUT = float(os.getenv("MODEL_LITE_TIMEOUT", "60"))
 if MODEL_LITE_TIMEOUT < 10:
     MODEL_LITE_TIMEOUT = 10.0
 
+
+def _env_int(name: str, default: int, minimum: int = 1) -> int:
+    try:
+        value = int(os.getenv(name, str(default)))
+    except ValueError:
+        value = default
+    return max(minimum, value)
+
+
+DOCKER_CLIENT_TIMEOUT = _env_int("DOCKER_CLIENT_TIMEOUT", 120)
 MATH_CONDA_BASE_IMAGE = os.getenv("MATH_CONDA_BASE_IMAGE", "anaconda/miniconda:latest")
 MATH_CONDA_ENV_NAME = os.getenv("MATH_CONDA_ENV_NAME", "math_env")
 MATH_CONDA_ENVS_VOLUME = os.getenv("MATH_CONDA_ENVS_VOLUME", "langgraph_math_conda_envs")
@@ -56,8 +66,8 @@ MATH_CONDA_INITIAL_PACKAGES = os.getenv(
     "MATH_CONDA_INITIAL_PACKAGES",
     "numpy sympy z3-solver networkx matplotlib scipy",
 ).split()
-MATH_CODE_TIMEOUT = int(os.getenv("MATH_CODE_TIMEOUT", "60"))
-MATH_CONDA_INSTALL_TIMEOUT = int(os.getenv("MATH_CONDA_INSTALL_TIMEOUT", "600"))
+MATH_CODE_TIMEOUT = _env_int("MATH_CODE_TIMEOUT", 60)
+MATH_CONDA_INSTALL_TIMEOUT = _env_int("MATH_CONDA_INSTALL_TIMEOUT", 600)
 WOLFRAM_BRIDGE_ENABLED = os.getenv("WOLFRAM_BRIDGE_ENABLED", "true").lower() == "true"
 WOLFRAM_BRIDGE_HOST = os.getenv("WOLFRAM_BRIDGE_HOST", "127.0.0.1")
 WOLFRAM_BRIDGE_PORT = int(os.getenv("WOLFRAM_BRIDGE_PORT", "8765"))
@@ -118,6 +128,7 @@ class RunData(BaseModel):
     question: str
     truth: str
     task_id: str = None
+    cache_bust_timestamp: int | None = None
 
 
 class HumanDecision(BaseModel):
@@ -272,12 +283,12 @@ _docker_client = None
 def _get_docker_client():
     global _docker_client
     if _docker_client is None:
-        _docker_client = docker.from_env(timeout=120)
+        _docker_client = docker.from_env(timeout=DOCKER_CLIENT_TIMEOUT)
     else:
         try:
             _docker_client.ping()
         except Exception:
-            _docker_client = docker.from_env(timeout=120)
+            _docker_client = docker.from_env(timeout=DOCKER_CLIENT_TIMEOUT)
     return _docker_client
 
 
@@ -681,6 +692,225 @@ async def get_task_result(task_id: str):
     return {"status": "not_found"}
 
 
+def _hitl_auto_repair_max_attempts() -> int:
+    try:
+        return max(0, int(os.getenv("HITL_AUTO_REPAIR_ATTEMPTS", "1")))
+    except ValueError:
+        return 1
+
+
+def _json_from_model_text(text: str) -> dict:
+    cleaned = (text or "").strip()
+    if cleaned.startswith("```"):
+        cleaned = re.sub(r"^```(?:json)?\s*", "", cleaned, flags=re.IGNORECASE)
+        cleaned = re.sub(r"\s*```$", "", cleaned).strip()
+    try:
+        return json.loads(cleaned)
+    except json.JSONDecodeError:
+        pass
+
+    decoder = json.JSONDecoder()
+    start = cleaned.find("{")
+    while start != -1:
+        try:
+            obj, _ = decoder.raw_decode(cleaned[start:])
+            if isinstance(obj, dict):
+                return obj
+        except json.JSONDecodeError:
+            start = cleaned.find("{", start + 1)
+            continue
+        break
+    return {}
+
+
+def _record_repair_node_data(thread_id: str):
+    state = sessions[thread_id]["state"]
+    sessions[thread_id]["nodes"]["analyze_and_solve"] = {
+        "status": "success",
+        "data": {
+            key: state.get(key)
+            for key in (
+                "trap_analysis",
+                "trap_reason",
+                "generated_code",
+                "hitl_auto_repair_summary",
+            )
+            if key in state
+        },
+    }
+    if "execution_output" in state:
+        sessions[thread_id]["nodes"]["code_executor"] = {
+            "status": "success",
+            "data": {"execution_output": state.get("execution_output")},
+        }
+    if "confidence_score" in state:
+        sessions[thread_id]["nodes"]["judge"] = {
+            "status": "success",
+            "data": {
+                key: state.get(key)
+                for key in ("confidence_score", "final_decision", "verified_ans")
+                if key in state
+            },
+        }
+
+
+def _repair_confident_enough(state: dict) -> bool:
+    try:
+        return float(state.get("confidence_score", 0)) >= 75
+    except (TypeError, ValueError):
+        return False
+
+
+def _attempt_hitl_auto_repair(thread_id: str, config: dict) -> bool:
+    max_attempts = _hitl_auto_repair_max_attempts()
+    if max_attempts <= 0:
+        return False
+
+    state = sessions[thread_id]["state"]
+    attempts = int(state.get("hitl_auto_repair_attempts", 0) or 0)
+    if attempts >= max_attempts:
+        return False
+
+    state["hitl_auto_repair_attempts"] = attempts + 1
+    state["hitl_auto_repair_summary"] = {
+        "status": "running",
+        "attempt": attempts + 1,
+        "max_attempts": max_attempts,
+    }
+    _record_repair_node_data(thread_id)
+
+    prompt = """
+You are MODEL_PRO repairing a math-code workflow before it is shown to a human reviewer.
+The current run is about to enter HITL because the judge confidence is below threshold or an error occurred.
+
+Return JSON only, with this schema:
+{"action":"accept|revise|give_up","reason":"short reason","code":"python code when action is revise, otherwise empty"}
+
+Rules:
+- Use "accept" only if the current execution output already proves the ground truth and the judge was too strict.
+- Use "revise" when the code should be replaced. The code must be complete executable Python that prints the answer/evidence.
+- Use "give_up" if the situation genuinely needs human review.
+- Do not include chain-of-thought or Markdown outside the JSON.
+""".strip()
+    user_content = f"""
+[Question]
+{state.get("question_context", "")}
+
+[Ground Truth]
+{state.get("ground_truth", "")}
+
+[Current Python Code]
+{state.get("generated_code", "")}
+
+[Execution Output]
+{state.get("execution_output", "")}
+
+[Judge Result]
+confidence_score={state.get("confidence_score", "")}
+final_decision={state.get("final_decision", "")}
+verified_ans={state.get("verified_ans", "")}
+""".strip()
+
+    try:
+        if pro_limiter:
+            pro_limiter.acquire()
+        response = create_chat_completion(
+            "PRO",
+            "gpt-5-pro",
+            messages=[
+                {"role": "system", "content": prompt},
+                {"role": "user", "content": user_content},
+            ],
+            temperature=1.0,
+            timeout=MATH_MODEL_TIMEOUT,
+            **reasoning_effort_kwargs("PRO"),
+        )
+        content = (response.choices[0].message.content or "").strip()
+        result = _json_from_model_text(content)
+        action = str(result.get("action", "")).lower().strip()
+        reason = str(result.get("reason", "")).strip()
+        revised_code = str(result.get("code", "") or "").strip()
+        if revised_code:
+            extracted_revised_code = extract_python_code(revised_code)
+            if extracted_revised_code.strip():
+                revised_code = extracted_revised_code
+
+        if action not in {"accept", "revise", "give_up"}:
+            extracted_code = extract_python_code(content)
+            if extracted_code.strip():
+                action = "revise"
+                revised_code = extracted_code
+                reason = reason or "MODEL_PRO returned code without valid JSON."
+            else:
+                action = "give_up"
+                reason = reason or "MODEL_PRO did not return valid JSON or executable code."
+
+        if action == "accept":
+            update = {
+                "confidence_score": max(float(state.get("confidence_score", 0) or 0), 75.0),
+                "final_decision": "Match",
+                "verified_ans": "pass",
+                "hitl_auto_repair_summary": {
+                    "status": "accepted",
+                    "attempt": attempts + 1,
+                    "reason": reason,
+                },
+            }
+            state.update(update)
+            graph_app.update_state(config, update)
+            _record_repair_node_data(thread_id)
+            return True
+
+        if action == "revise":
+            if not revised_code.strip():
+                state["hitl_auto_repair_summary"] = {
+                    "status": "failed",
+                    "attempt": attempts + 1,
+                    "reason": reason or "MODEL_PRO chose revise but did not provide code.",
+                }
+                graph_app.update_state(config, state)
+                _record_repair_node_data(thread_id)
+                return False
+
+            repair_state = state.copy()
+            repair_state["generated_code"] = revised_code
+            exec_update = math_conda_code_executor_node(repair_state)
+            repair_state.update(exec_update)
+            judge_update = judge_node(repair_state)
+            repair_state.update(judge_update)
+            repair_state["hitl_auto_repair_summary"] = {
+                "status": "revised",
+                "attempt": attempts + 1,
+                "reason": reason,
+                "accepted": _repair_confident_enough(repair_state),
+            }
+            state.update(repair_state)
+            graph_app.update_state(config, repair_state)
+            _record_repair_node_data(thread_id)
+            return _repair_confident_enough(repair_state)
+
+        state["hitl_auto_repair_summary"] = {
+            "status": "gave_up",
+            "attempt": attempts + 1,
+            "reason": reason or "MODEL_PRO requested human review.",
+        }
+        graph_app.update_state(config, state)
+        _record_repair_node_data(thread_id)
+        return False
+    except Exception as e:
+        state["hitl_auto_repair_summary"] = {
+            "status": "error",
+            "attempt": attempts + 1,
+            "reason": str(e),
+        }
+        try:
+            graph_app.update_state(config, state)
+        except Exception:
+            pass
+        _record_repair_node_data(thread_id)
+        return False
+
+
 def _mark_next_nodes(thread_id: str, config: dict):
     current_state = graph_app.get_state(config)
     for next_node in current_state.next:
@@ -697,10 +927,20 @@ def _finish_or_block(thread_id: str, config: dict):
     sessions[thread_id]["state"].update(state_info.values or {})
     needs_hitl = state_info.next and "human_review" in state_info.next
     if needs_hitl:
+        if _attempt_hitl_auto_repair(thread_id, config):
+            sessions[thread_id]["status"] = "finished"
+            sessions[thread_id]["nodes"]["__end__"] = {
+                "status": "success",
+                "data": sessions[thread_id]["state"],
+            }
+            return
         sessions[thread_id]["status"] = "blocked"
         sessions[thread_id]["nodes"]["human_review"] = {
             "status": "blocked",
-            "data": {"message": "Waiting for manual review..."},
+            "data": {
+                "message": "Waiting for manual review...",
+                "auto_repair": sessions[thread_id]["state"].get("hitl_auto_repair_summary"),
+            },
         }
     else:
         sessions[thread_id]["status"] = "finished"
@@ -775,10 +1015,16 @@ def _run_graph_quiet(thread_id: str, config: dict, initial_state: dict):
 async def start_run(data: RunData):
     thread_id = str(uuid.uuid4())
     config = {"configurable": {"thread_id": thread_id}}
+    question_context = data.question
+    if data.cache_bust_timestamp is not None:
+        question_context = (
+            f"{question_context}\n\n"
+            f"[Restart Unix Timestamp]\n{data.cache_bust_timestamp}"
+        )
 
     initial_state = {
         "question_id": data.task_id if data.task_id else f"q_{thread_id[:4]}",
-        "question_context": data.question,
+        "question_context": question_context,
         "ground_truth": data.truth,
     }
 
